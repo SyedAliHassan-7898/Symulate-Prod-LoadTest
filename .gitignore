@@ -1,0 +1,20 @@
+# Local runtime configuration / secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Generated test output
+reports/*
+!reports/.gitkeep
+playwright/artifacts/
+test-results/
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
