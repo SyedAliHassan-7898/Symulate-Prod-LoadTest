@@ -1,38 +1,57 @@
-# Symulate AI Load, Smoke, and Browser Validation Suite
+# Symulate AI Load Testing & Monitoring Suite
 
-Production-oriented k6 + Playwright validation for the Symulate AI dev environment.
+Production-oriented k6 + Playwright validation suite for the Symulate AI platform. Covers smoke testing, isolated load testing, shared-project concurrent load testing, Anam AI validation, and optional Grafana/InfluxDB live monitoring.
 
-The repository covers:
+---
 
-- isolated Super Admin → Client → Project provisioning;
-- activity creation and stage assignment;
-- mandatory Welcome-stage composition;
-- CSV-backed candidate provisioning and project assignment;
-- project invitation / activation lifecycle;
-- generated and pre-provisioned candidate execution;
-- candidate booking, transcript persistence, and activity completion;
-- project review checks;
-- Anam enabled/disabled/resilience browser validation;
-- optional InfluxDB/Grafana output;
-- local HTML/JSON/CSV reports.
+## Table of Contents
+
+1. [Prerequisites](#1-prerequisites)
+2. [Installation](#2-installation)
+3. [Environment Setup](#3-environment-setup)
+4. [Test Commands Overview](#4-test-commands-overview)
+5. [Smoke Test](#5-smoke-test)
+6. [Isolated Load Test (`npm run load`)](#6-isolated-load-test)
+7. [Shared-Project Concurrent Load Test (`npm run load:shared`)](#7-shared-project-concurrent-load-test) ⭐ **Primary Load Command**
+8. [Pre-Provisioned Candidate Load (`npm run load:candidate`)](#8-pre-provisioned-candidate-load)
+9. [Anam AI Validation](#9-anam-ai-validation)
+10. [Activity-Specific Load Commands](#10-activity-specific-load-commands)
+11. [Project Invitation Lifecycle](#11-project-invitation-lifecycle)
+12. [Candidate Provisioning](#12-candidate-provisioning)
+13. [Performance Profiles](#13-performance-profiles)
+14. [Reports](#14-reports)
+15. [Grafana / InfluxDB Monitoring](#15-grafana--influxdb-monitoring)
+16. [Key `.env` Variables Reference](#16-key-env-variables-reference)
+17. [Troubleshooting](#17-troubleshooting)
+18. [Recommended Configurations](#18-recommended-configurations)
+
+---
 
 ## 1. Prerequisites
 
-Install:
+| Tool | Minimum Version | Purpose |
+|------|----------------|---------|
+| Node.js | 20+ | Runner scripts |
+| npm | bundled with Node | Package management |
+| k6 | latest | Load test execution |
+| Docker Desktop | latest | Grafana/InfluxDB monitoring (optional) |
+| Chromium | via Playwright | Browser validation |
 
-- Node.js 20+ (Node 24 is supported by the project scripts);
-- npm;
-- k6;
-- Docker Desktop only when Grafana/InfluxDB monitoring is required;
-- Chromium for Playwright (`npm run playwright:install`).
-
-Verify:
+Verify installation:
 
 ```bat
 node --version
 npm --version
 k6 version
 ```
+
+Install Playwright browsers:
+
+```bat
+npm run playwright:install
+```
+
+---
 
 ## 2. Installation
 
@@ -41,553 +60,577 @@ npm install
 copy .env.example .env
 ```
 
-Populate the real environment credentials in `.env`.
+Edit `.env` with real credentials. Never commit `.env` — it is Git-ignored.
 
-Do not commit `.env`. It is ignored by Git and is intentionally excluded from distributable ZIPs. Set `RUNNER_VERBOSE=true` only when you need the full redacted k6 command; normal runs print a concise configuration summary.
-
-Then validate the repository:
+Validate the repository setup:
 
 ```bat
 npm run validate
 ```
 
-## 3. Environment contract
+---
 
-### Required platform values
+## 3. Environment Setup
+
+Copy `.env.example` to `.env` and fill in:
 
 ```env
+# Platform URLs
 ENV=dev
 API_URL=https://api.symulate.weuno.co/dev/api
 SUPER_ADMIN_URL=https://superadmin.symulate-dev.weuno.co
 CLIENT_ADMIN_URL=https://client-admin.symulate-dev.weuno.co
 CANDIDATE_URL=https://symulate-ai-dev.weuno.co
-ACTIVITY_IMAGE_URL=https://symulate-ai-dev.weuno.co/favicon.ico
+ACTIVITY_IMAGE_URL=https://d5uk4ljnw67gt.cloudfront.net/create_task/images-...
 
-SUPER_ADMIN_EMAIL=...
+# Admin credentials
+SUPER_ADMIN_EMAIL=superadmin@yopmail.com
 SUPER_ADMIN_PASSWORD=...
-```
 
-### Generated project candidate count
+# Load test settings
+NUM_CANDIDATES=10          # candidates to provision per project
+LOAD_VUS=10                # concurrent virtual users in Phase 2
+LOAD_MAX_DURATION=10m      # max duration for Phase 2
 
-```env
-NUM_CANDIDATES=20
-```
-
-Every managed project provisions exactly 20 generated candidates by default from the canonical seed file `data/candidates.csv`.
-
-The repository contains 20 seed rows. If `NUM_CANDIDATES` is higher than the number of seed rows, the run fails immediately instead of silently reducing the count.
-
-Candidate emails are made unique per VU and iteration, for example:
-
-```text
-john1.load.<run-id>.1@yopmail.com
-john2.load.<run-id>.2@yopmail.com
-...
-john20.load.<run-id>.20@yopmail.com
-```
-
-`data/candidates.csv` is the source of truth for names and email seeds. The managed flow does **not** call the asynchronous `/candidate/upload-candidates` queue, because that endpoint only returns a queue summary and does not return the candidate IDs required by project assignment. Using that queue and then calling `create-for-project` created duplicate organization users in earlier versions.
-
-The production flow now reads the CSV, generates collision-safe per-run email addresses, creates each candidate once with the confirmed `create-for-project` API (`force=false`), bulk-assigns the returned IDs, and verifies all expected emails through the project detail endpoint.
-
-## 4. Project invitation lifecycle
-
-`SEND_PROJECT_INVITATIONS` is the single source of truth.
-
-No runner silently overrides it.
-
-### Invitations enabled
-
-```env
-SEND_PROJECT_INVITATIONS=true
-```
-
-The managed flow:
-
-1. creates the client and project;
-2. creates the selected activities;
-3. creates the project stage;
-4. reads `NUM_CANDIDATES` rows from `data/candidates.csv`;
-5. creates each project candidate exactly once through the confirmed candidate API;
-6. bulk-assigns all returned candidate IDs to the project;
-7. verifies all expected candidate emails are visible on that exact project;
-8. selects an email template;
-9. sends project invitations;
-10. verifies the project becomes `ACTIVE`;
-11. only then allows candidate activity execution.
-
-A failed invitation or failure to reach `ACTIVE` blocks candidate execution.
-
-The backend project payload also exposes a `candidateAccess` field. In the current dev API this field can remain `false` even after invitation dispatch succeeds, the project is `ACTIVE`, all expected candidates are attached, and candidate portal-token login succeeds. v9 therefore treats `candidateAccess` as diagnostic only. Real candidate readiness is proven by the candidate authentication/session path rather than by that stale project flag.
-
-### Invitations disabled
-
-```env
+# Dev environment flags
+ENFORCE_BOOKING=false      # set true when booking API is available
 SEND_PROJECT_INVITATIONS=false
+ANAM_MODE=disabled
+ANUM_API_ENABLED=false
 ```
 
-`npm run smoke` becomes a provisioning-only run.
+> **Note:** `npm run load:shared` reads `NUM_CANDIDATES` and `LOAD_VUS` directly from `.env`. The values in the npm script definition are overridden by your `.env` file.
 
-It may create the organization, activities, project, stage, and candidates, but it does **not**:
+---
 
-- create a candidate portal session;
-- accept the candidate agreement;
-- create a booking;
-- start an activity session;
-- open the transcript socket;
-- mark an activity `COMPLETED`.
+## 4. Test Commands Overview
 
-This behavior is intentional because a project that has not passed the invitation/activation lifecycle can remain `DRAFT`.
+| Command | What it does | VUs | Projects | Candidates |
+|---------|-------------|-----|----------|------------|
+| `npm run smoke` | Full smoke: provision + 1 candidate | 1 | 1 | NUM_CANDIDATES |
+| `npm run load` | Isolated load: N VUs, each own project | LOAD_VUS | LOAD_VUS | LOAD_VUS × NUM_CANDIDATES |
+| **`npm run load:shared`** | **Shared-project: N concurrent candidates** | **LOAD_VUS** | **1** | **NUM_CANDIDATES** |
+| `npm run load:candidate` | Pre-provisioned candidate only | 1 | existing | existing |
+| `npm run e2e:anam:outage503` | Anam outage + recovery E2E | 1 | 1 | NUM_CANDIDATES |
 
-The expected log is similar to:
+---
 
-```text
-SEND_PROJECT_INVITATIONS=false: invitation dispatch is disabled...
-Provisioning-only completion ... candidate activity execution skipped.
-```
-
-## 5. Which candidate performs during `npm run smoke`
-
-Configure:
-
-```env
-CANDIDATE_EXECUTION_SOURCE=auto
-```
-
-Supported values:
-
-| Value | Behavior |
-|---|---|
-| `auto` | Smoke: run the generated candidate plus the pre-provisioned candidate when the latter is fully configured. Load: generated candidate only. |
-| `generated` | Run the first candidate from the newly-created project. |
-| `preprovisioned` | Run only the candidate configured by `CANDIDATE_*` / `ASSESSMENT_*`. |
-| `both` | Run generated and pre-provisioned candidates. |
-| `none` | Do not execute candidate activities after activation. |
-
-Candidate execution is still blocked when `SEND_PROJECT_INVITATIONS=false`.
-
-### Pre-provisioned candidate
-
-```env
-CANDIDATE_EMAIL=performer35@yopmail.com
-CANDIDATE_PASSWORD=...
-ASSESSMENT_CANDIDATE_ID=...
-ASSESSMENT_PROJECT_ID=...
-ASSESSMENT_BOOKING_ID=...
-ASSESSMENT_BOOKING_START_AT=...
-```
-
-The smoke flow resolves the candidate against the configured project using the Super Admin session. It does not use the newly-created client admin session to read an unrelated pre-provisioned project.
-
-For a deterministic managed-project check, use:
-
-```env
-CANDIDATE_EXECUTION_SOURCE=generated
-```
-
-For the original combined smoke behavior, use:
-
-```env
-CANDIDATE_EXECUTION_SOURCE=both
-```
-
-## 6. Smoke test
+## 5. Smoke Test
 
 ```bat
 npm run smoke
 ```
 
-Smoke always uses one VU and one iteration.
+Runs 1 VU through the full lifecycle:
 
-The `.env` `LOAD_VUS` value does not change smoke concurrency. `LOAD_VUS=10` is used only when `LOAD_MODE=load` (for example `npm run load:10`).
+1. Super Admin login
+2. Create organization (Client)
+3. Create 6 activity types (Role Play, Interview, Case, Situation, Board Meeting, Welcome)
+4. Create project + stage + assign activities
+5. Provision `NUM_CANDIDATES` candidates from `data/candidates.csv`
+6. Send project invitations → verify project becomes `ACTIVE`
+7. Candidate logs in via invitation href → accepts agreement → performs all 6 activities
+8. Each activity: start session → WebSocket transcript → mark `COMPLETED`
 
-With `CANDIDATE_EXECUTION_SOURCE=auto` and a complete pre-provisioned candidate configuration, smoke runs the generated managed-project candidate first and then the configured pre-provisioned candidate. The run contains explicit checks so either path cannot be silently skipped.
-
-Recommended complete smoke configuration:
-
-```env
-LOAD_MODE=smoke
-NUM_CANDIDATES=20
-SEND_PROJECT_INVITATIONS=true
-CANDIDATE_EXECUTION_SOURCE=auto
-```
-
-## 7. Isolated load behavior
-
-Managed resource-creation load uses `per-vu-iterations`.
+Recommended smoke config:
 
 ```env
-LOAD_MODE=load
-LOAD_VUS=10
-LOAD_ITERATIONS_PER_VU=1
-NUM_CANDIDATES=20
+NUM_CANDIDATES=10
+LOAD_VUS=1
+SEND_PROJECT_INVITATIONS=false
+ENFORCE_BOOKING=false
 ```
 
-Then:
+---
+
+## 6. Isolated Load Test
 
 ```bat
 npm run load
 ```
 
-means:
+Each VU independently provisions its own project with its own candidates.
 
-```text
-10 VUs
-x 1 isolated provisioning iteration per VU
-= 10 clients
-= 10 projects
-= 200 generated candidates total
+**With `LOAD_VUS=10`, `NUM_CANDIDATES=10`:**
+
+```
+VU 1  → creates Client A → Project A → 10 candidates → performs activities
+VU 2  → creates Client B → Project B → 10 candidates → performs activities
+...
+VU 10 → creates Client J → Project J → 10 candidates → performs activities
 ```
 
-Each VU owns its own client, activity set, project, candidate set, booking state, and managed candidate execution. VUs do not share mutable generated project state.
+Total: 10 projects, 100 candidates.
 
-**Email volume note:** when `SEND_PROJECT_INVITATIONS=true`, a 10-project load with 20 candidates per project can request up to 200 candidate invitation emails. Set the toggle to `false` for provisioning/performance runs where email delivery is not the system under test; candidate activity execution will then be intentionally skipped for those managed projects.
+> ⚠️ **Warning:** High VU counts (e.g. 150) cause 429 rate limiting on concurrent `Create Client` calls. Use `npm run load:shared` for large concurrent tests.
 
-Useful commands:
+---
+
+## 7. Shared-Project Concurrent Load Test
+
+> ⭐ **This is the primary command for testing concurrent user load on a single project.**
 
 ```bat
-npm run load:10
-npm run load:client-project:10
-npm run load:situation
-npm run load:role-play
-npm run load:interview
-npm run load:case
-npm run load:board-meeting
-npm run load:welcome
+npm run load:shared
 ```
 
-## 8. Performance profiles and load exit codes
+### What it does
 
-Functional correctness and latency SLOs are separate concerns. A load run can create all expected resources with zero failed HTTP requests but still exit non-zero when a latency threshold is crossed.
+A 2-phase orchestrated test:
 
-Use:
+**Phase 1 — Provision (sequential, 1 VU):**
+
+```
+Super Admin
+  → Create 1 Client (organization)
+  → Create 6 activities
+  → Create 1 Project with stage + activities
+  → Provision NUM_CANDIDATES unique candidates
+  → Send invitations → verify project ACTIVE
+  → Capture all invitation hrefs → write to temp file
+```
+
+**Phase 2 — Concurrent load (LOAD_VUS VUs simultaneously):**
+
+```
+VU 1   → john1@ invitation href → login → 6 activities ✓
+VU 2   → john2@ invitation href → login → 6 activities ✓
+VU 3   → john3@ invitation href → login → 6 activities ✓
+...
+VU N   → johnN@ invitation href → login → 6 activities ✓
+```
+
+All VUs start at the same time. Each VU has its own unique candidate identity — no shared credentials.
+
+### How load is controlled
+
+The load is determined **exclusively by `.env`**:
 
 ```env
-PERFORMANCE_PROFILE=auto
+NUM_CANDIDATES=10    # how many candidates to provision in Phase 1
+LOAD_VUS=10         # how many concurrent VUs in Phase 2
+LOAD_MAX_DURATION=10m
 ```
 
-Profiles:
+> The npm script sets `NUM_CANDIDATES=150 LOAD_VUS=150` as defaults, but your `.env` values always take priority because the runner reads `.env` directly.
 
-```text
-auto       -> strict for smoke; baseline for load
-strict     -> p95/p99 regression gate used for low-concurrency validation
-baseline   -> concurrency-aware dev/load gate; all latency percentiles are still reported
-functional -> correctness/request-failure gates only; latency is reported but does not fail the run
+### Scale examples
+
+| `.env` setting | Server load |
+|----------------|-------------|
+| `NUM_CANDIDATES=10, LOAD_VUS=10` | 10 concurrent candidate sessions |
+| `NUM_CANDIDATES=50, LOAD_VUS=50` | 50 concurrent candidate sessions |
+| `NUM_CANDIDATES=150, LOAD_VUS=150` | 150 concurrent candidate sessions |
+
+### Why shared-project instead of isolated?
+
+| Approach | Projects | Rate limit risk | Realistic? |
+|----------|----------|-----------------|------------|
+| `load` (isolated) | 150 | High — 150 concurrent Create Client calls → 429 | No |
+| `load:shared` | 1 | Low — 1 provisioning, then burst | Yes ✓ |
+
+Real users all work on the same project. `load:shared` simulates that accurately.
+
+### Running for 150 concurrent users
+
+1. Update `.env`:
+
+```env
+NUM_CANDIDATES=150
+LOAD_VUS=150
+LOAD_MAX_DURATION=30m
+ENFORCE_BOOKING=false
 ```
 
-The baseline load profile keeps the global p95 below 2s, allows global p99 up to 12s, `Create Client` p95 up to 3s, and `Assign Task` p95 up to 12s. These bounds reflect the shared dev environment behavior observed under 10 concurrent provisioning VUs; they are not a production SLO. Set `PERFORMANCE_PROFILE=strict` whenever you want the tighter gate to fail the run.
+2. Run:
 
-## 9. Welcome dependency
-
-The backend requires exactly one Welcome activity in every stage.
-
-The suite composes focused scenarios automatically:
-
-```text
-role-play-only      -> ROLE_PLAY + WELCOME
-interview-only      -> INTERVIEW + WELCOME
-case-only           -> CASE + WELCOME
-situation-only      -> SITUATIONS + WELCOME
-board-meeting-only  -> BOARD_MEETING + WELCOME
-welcome-only        -> WELCOME
-full                -> all activity types, including one WELCOME
+```bat
+npm run load:shared
 ```
 
-If stage composition resolves zero or multiple Welcome activities, the test stops before assignment.
+3. Phase 1 takes ~3-5 minutes to provision 150 candidates (rate-limit retries included).
 
-## 10. Candidate provisioning behavior
+4. Phase 2 fires 150 VUs simultaneously — each performs all 6 activities.
 
-`data/candidates.csv` is the canonical seed file for managed project candidates. The suite reads the requested number of seed rows, generates a unique email for each VU/iteration, and provisions each candidate through the deterministic project-candidate API:
+### Expected output
 
-```text
-data/candidates.csv
-  -> select NUM_CANDIDATES seed rows
-  -> generate unique per-run candidate emails
-  -> POST /candidate/create-for-project?projectId=... with force=false
-  -> capture every returned candidate ID
-  -> bulk-assign those IDs to the project
-  -> verify every expected generated email is visible on the project
+**Phase 1 complete:**
+```
+Phase 1 complete:
+  Project ID  : xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  Candidates  : 150 hrefs captured
+  Hrefs file  : C:\Users\...\AppData\Local\Temp\shared-hrefs-<ts>.b64
 ```
 
-The legacy asynchronous CSV-upload endpoint is intentionally not used by the managed load flow because its accepted response does not provide candidate IDs and the project-scoped lookup cannot resolve unassigned candidates. The older combination of CSV upload plus `create-for-project` was also removed because it could duplicate organization candidates.
+**Phase 2 summary:**
+```
+checks.........................: 98%+ ✓ 
+http_req_duration..............: p(95)<5000
+ws_sessions....................: 900   (150 VUs × 6 activities)
+iterations.....................: 150
+```
 
-For a 10-VU run with `NUM_CANDIDATES=20`, the suite therefore creates and verifies 200 unique candidates across 10 isolated projects.
+### Known dev-environment behaviors
 
-## 11. Candidate activity completion
+| Behavior | Cause | Impact |
+|----------|-------|--------|
+| `candidate portal theme: 500` (4/150) | Duplicate key race condition on first portal access | Non-blocking — activities still complete |
+| `Accept Agreement: timeout` | Dev server overwhelmed at 10+ concurrent calls | Some VUs retry and succeed; reflects actual server capacity |
+| `http_req_failed > 10%` | Dev environment rate limits | Expected; threshold is set at 10% for dev |
+| `portal-tokens: 404` | Not available on dev env | Auto-fallback to invitation-href login |
 
-Candidate activity execution follows:
+These are **server-side findings** from the load test — exactly what load testing is meant to reveal.
 
-1. portal-token session using `{ candidateId, projectId }`;
-2. agreement acceptance;
-3. booking and entry gate;
-4. activity session-token request;
-5. transcript persistence over Socket.IO;
-6. `PATCH /activities/candidate-activity/update-status/{activityId}` with `COMPLETED`.
+---
 
-The legacy `/sessions/{sessionId}/complete` endpoint is not used.
-
-## 12. Focused pre-provisioned candidate load
+## 8. Pre-Provisioned Candidate Load
 
 ```bat
 npm run load:candidate
 ```
 
-This command does not create a new project. Configure one candidate/project pair per VU:
+Runs a single pre-provisioned candidate against an existing project.
+
+> ⚠️ **Dev environment limitation:** This command uses email+password login, but the dev API returns `403 Candidates are not allowed to access this resource` when accessing project details via password login. Candidate project access requires invitation href tokens on this environment. Use `npm run load:shared` instead for concurrent testing.
+
+Configure in `.env`:
 
 ```env
-CANDIDATE_EMAIL=...
+CANDIDATE_EMAIL=your.candidate@yopmail.com
 CANDIDATE_PASSWORD=...
 ASSESSMENT_CANDIDATE_ID=...
 ASSESSMENT_PROJECT_ID=...
-
-CANDIDATE_EMAIL_2=...
-CANDIDATE_PASSWORD_2=...
-ASSESSMENT_CANDIDATE_ID_2=...
-ASSESSMENT_PROJECT_ID_2=...
 ```
 
-By default the suite refuses to share one pre-provisioned candidate across multiple VUs. Set `ALLOW_SHARED_CANDIDATES=true` only for an intentional contention test.
+---
 
-## 13. Anam validation
+## 9. Anam AI Validation
 
-Modes:
-
-```text
-disabled
-healthy
-outage503
-network
-```
-
-Commands:
+Full 3-phase E2E with Playwright browser automation:
 
 ```bat
-npm run validate:e2e-runner
-npm run playwright:install
-npm run e2e:anam:disabled
-npm run e2e:anam:healthy
-npm run e2e:anam:outage503
-npm run e2e:anam:network
+npm run e2e:anam:disabled     # Anam disabled flow
+npm run e2e:anam:healthy      # Anam enabled, healthy
+npm run e2e:anam:outage503    # Anam 503 mid-session outage + recovery
+npm run e2e:anam:network      # Anam network failure simulation
 ```
 
-The specialized `e2e:anam:*` and `e2e:no-anum:full` npm commands explicitly enable `SEND_PROJECT_INVITATIONS=true` for the isolated E2E project they create. This command-level override is intentional: these tests exercise browser/session activity execution and cannot run against a provisioning-only DRAFT project. It does **not** modify `.env`, and normal `smoke` / `load` commands continue to use the `.env` toggle exactly as configured.
+Each command runs:
+- **Phase 1:** k6 provisions project + candidates, emits session data
+- **Phase 2:** k6 audit candidates perform activities via API
+- **Phase 3:** Playwright browser candidate completes activities with UI validation
 
-At least seven candidates are required: one browser candidate plus one isolated audit candidate for each of six activities. The default `NUM_CANDIDATES=20` project satisfies this requirement.
+Minimum `NUM_CANDIDATES=7` required (1 browser + 6 audit candidates).
 
-Phase 1 now requires the project to be `ACTIVE`, the invitation template to be present, all expected candidates to be attached, and the reserved browser candidate to obtain a real portal token. The project-level `candidateAccess` flag is logged for diagnostics but is not used as a hard gate because the current backend can report it as `false` while portal-token access already works.
+Mid-session outage test (`outage503`):
+1. Anam sessions start successfully
+2. HTTP 503 injected mid-session
+3. WebSocket traffic interrupted
+4. Recovery window re-allows traffic
+5. Session resumes and completes
 
-### Mid-session outage
+---
 
-`outage503` allows initial Anam engine/session and metrics calls to succeed, then injects HTTP 503 responses and interrupts Anam WebSocket traffic. The configured recovery window then re-allows Anam traffic.
+## 10. Activity-Specific Load Commands
 
-## 14. Playwright microphone
+```bat
+npm run load:situation        # Situation + Welcome activities only
+npm run load:role-play        # Role Play + Welcome
+npm run load:interview        # Interview + Welcome
+npm run load:case             # Case Study + Welcome
+npm run load:board-meeting    # Board Meeting + Welcome
+npm run load:welcome          # Welcome only
+npm run load:10               # Full scenario, 10 VUs
+npm run load:client-project:10 # Client + Project creation only, 10 VUs
+```
 
-Recommended automated mode:
+> Every stage requires exactly one Welcome activity. Focused scenarios automatically include Welcome alongside the target activity type.
+
+---
+
+## 11. Project Invitation Lifecycle
+
+`SEND_PROJECT_INVITATIONS` controls whether invitation emails are sent.
+
+| Value | Behavior |
+|-------|----------|
+| `true` | Full lifecycle: create → invite → ACTIVE → candidate can access |
+| `false` | Provisioning only: project stays DRAFT, no candidate execution |
+
+`npm run load:shared` always sets `SEND_PROJECT_INVITATIONS=true` internally for its Phase 1 provisioning, regardless of your `.env` value. This is required because candidates need valid invitation hrefs.
+
+> The dev environment's `portal-tokens` endpoint returns 404. The suite automatically falls back to invitation-href login (access_token in URL) — this is expected and handled transparently.
+
+---
+
+## 12. Candidate Provisioning
+
+All managed flows use `data/candidates.csv` as the seed file.
+
+**Flow:**
+```
+data/candidates.csv
+  → select NUM_CANDIDATES rows
+  → generate unique per-run emails: john1.load.<timestamp>.1@yopmail.com
+  → POST /candidate/create-for-project?projectId=...
+  → bulk-assign returned IDs to project
+  → verify all expected emails visible on project
+```
+
+The async CSV-upload endpoint (`/candidate/upload-candidates`) is intentionally not used — it does not return candidate IDs required for project assignment.
+
+Email pattern: `john{N}.load.{timestamp}.{N}@yopmail.com`
+
+`data/candidates.csv` contains 20 seed rows. `NUM_CANDIDATES` must not exceed the seed count.
+
+---
+
+## 13. Performance Profiles
 
 ```env
-HEADLESS=true
-PLAYWRIGHT_MICROPHONE_MODE=fake
+PERFORMANCE_PROFILE=auto      # strict for smoke, baseline for load (default)
+PERFORMANCE_PROFILE=strict    # tight p95/p99 gates — low-concurrency validation
+PERFORMANCE_PROFILE=baseline  # concurrency-aware — dev/load gate
+PERFORMANCE_PROFILE=functional # correctness only — latency not gated
 ```
 
-This grants microphone permission to the candidate portal and launches Chromium with a deterministic fake media input.
+Baseline thresholds (dev environment):
+- Global p95 < 2s
+- Global p99 < 12s
+- `Create Client` p95 < 3s
+- Activity operations p95 < 5s
 
-To use the host microphone:
+A run can complete all operations successfully but still exit non-zero if latency thresholds are crossed. This is intentional — correctness and performance are separate signals.
 
-```env
-HEADLESS=false
-PLAYWRIGHT_MICROPHONE_MODE=system
-```
+---
 
-Windows microphone permissions must also allow desktop applications.
+## 14. Reports
 
-## 15. Reports
+All managed runs write to `reports/`:
 
-Managed runs write reports under `reports/`:
+| File | Content |
+|------|---------|
+| `*.html` | Interactive HTML report |
+| `*.json` | Raw k6 metrics data |
+| `*-overview.csv` | High-level summary |
+| `*-summary.csv` | Per-check summary |
+| `*-aggregate.csv` | Aggregated metrics |
+| `*-checks.csv` | Individual check results |
 
-- HTML;
-- JSON;
-- overview CSV;
-- summary CSV;
-- aggregate CSV;
-- checks CSV.
+Playwright artifacts: `playwright/artifacts/`
 
-Playwright writes browser artifacts below `playwright/artifacts/`.
+All report files are Git-ignored.
 
-Generated artifacts are ignored by Git.
+---
 
-## 16. Grafana / InfluxDB
+## 15. Grafana / InfluxDB Monitoring
 
-Start monitoring:
+Start monitoring stack:
 
 ```bat
 npm run monitoring:up
 npm run monitoring:status
 ```
 
-Run:
+Run tests with live dashboard:
 
 ```bat
 npm run smoke:grafana
 npm run load:grafana
 ```
 
-Stop:
+Access Grafana: `http://localhost:3000`
+
+Stop monitoring:
 
 ```bat
 npm run monitoring:down
 ```
 
-The runner checks InfluxDB before launching k6 and stops with a clear error if monitoring is unavailable.
+The runner verifies InfluxDB connectivity before launching k6 and fails fast with a clear error if monitoring is unavailable.
+
+---
+
+## 16. Key `.env` Variables Reference
+
+### Load control
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NUM_CANDIDATES` | `10` | Candidates to provision per project |
+| `LOAD_VUS` | `10` | Concurrent VUs in load phase |
+| `LOAD_MAX_DURATION` | `10m` | Max Phase 2 duration |
+| `LOAD_ITERATIONS_PER_VU` | `1` | Iterations per VU |
+
+### Feature flags
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SEND_PROJECT_INVITATIONS` | `false` | Send invitation emails |
+| `ENFORCE_BOOKING` | `false` | Require booking before activities |
+| `ANAM_MODE` | `disabled` | Anam AI mode |
+| `ANUM_API_ENABLED` | `false` | Enable Anam API calls |
+
+### Candidate execution
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CANDIDATE_EXECUTION_SOURCE` | `auto` | `auto` / `generated` / `preprovisioned` / `both` / `none` |
+| `SCENARIO` | `full` | Activity scenario (full / role-play-only / etc.) |
+
+### Dev environment notes
+
+- `portal-tokens` endpoint returns 404 — invitation-href login is used automatically
+- `ENFORCE_BOOKING=false` — booking API returns 404 on dev
+- `candidateAccess` project flag may show `false` even when project is ACTIVE — treated as diagnostic only
+
+---
 
 ## 17. Troubleshooting
 
-### Anam Phase 1 fails on `project active: candidate access enabled`
+### `load:shared` shows `NUM_CANDIDATES=10` even with `npm run load:shared`
 
-This was a false-negative activation check in v8. The dev API can report `candidateAccess=false` after the project is already `ACTIVE` and candidate portal-token login succeeds. v9 no longer treats that field as the activation contract. If Phase 1 still fails, inspect the invitation response, project `ACTIVE` status, project candidate count, and the candidate portal-token login check.
+The runner reads `.env` directly. The `cross-env` values in the npm script are overridden by `.env`.
 
-### `SEND_PROJECT_INVITATIONS=false` but activities are starting
-
-This should not occur in this version. `npm run validate` checks that the runners do not override the environment value and that `tests/smoke.js` contains the lifecycle gate.
-
-Confirm the runner line contains:
-
-```text
-projectInvitations=false
-```
-
-The run should finish after provisioning without candidate activity logs.
-
-### Only one candidate appears in the project
-
-Confirm:
-
+**Fix:** Update `.env`:
 ```env
-NUM_CANDIDATES=20
+NUM_CANDIDATES=150
+LOAD_VUS=150
 ```
 
-The log must say:
+### `SHARED_CANDIDATE_HREFS is empty or invalid`
 
-```text
-Creating isolated project data ... 20 unique candidate(s)
-```
+Phase 1 failed to emit hrefs. Check Phase 1 output for errors. Usually caused by:
+- `NUM_CANDIDATES` exceeds seed rows in `data/candidates.csv` (max 20)
+- Network timeout during provisioning
+- Rate limiting (add retry delay)
 
-The log must then report `Candidate provisioning complete: 20/20 candidates assigned to project ...`.
+### `Get Project Details → 403` in `load:candidate`
 
-### `Import Candidates (CSV) -> 201` but `resolved 0/20`
+Dev environment requires invitation-href login. Email+password login succeeds but cannot access project APIs.
 
-That was the v6 asynchronous-import defect. A `201` from `/candidate/upload-candidates` only confirmed queue acceptance; it did not provide candidate IDs. v8 keeps that queue out of managed provisioning. Candidate creation is now deterministic and sourced from `data/candidates.csv` through the confirmed `create-for-project` endpoint, followed by bulk assignment and direct project verification.
+**Use `npm run load:shared` instead** — it uses invitation-href login automatically.
 
-If you still see `Resolve Imported Candidates` in a run, you are executing an older project folder.
+### `accept agreement: timeout` in Phase 2
 
-### Pre-provisioned candidate does not run during smoke
+Dev server is overwhelmed by concurrent agreement calls. This is a **server finding** — the test is doing its job.
 
-Confirm all of these are set:
+Expected at 10+ concurrent VUs on dev. The suite retries and most VUs recover.
 
-```env
-CANDIDATE_EXECUTION_SOURCE=auto
-CANDIDATE_EMAIL=...
-ASSESSMENT_CANDIDATE_ID=...
-ASSESSMENT_PROJECT_ID=...
-```
+### `candidate portal theme: 500` (duplicate key error)
 
-With a complete pre-provisioned candidate, `auto` resolves to `both` in smoke mode.
+Race condition in backend on first portal access when multiple candidates log in simultaneously. Non-blocking — activities still complete. This is a backend issue revealed by load testing.
 
-### Managed project shows no completed candidate activity
+### `portal-tokens → 404`
 
-Use:
+Expected on dev. The suite automatically falls back to invitation-href login. No action needed.
 
-```env
-SEND_PROJECT_INVITATIONS=true
-CANDIDATE_EXECUTION_SOURCE=generated
-```
+### Phase 1 takes a long time (150 candidates)
 
-The generated candidate is then executed against the same project that was created by the smoke run, so Client Admin completion state can be checked on that project.
+Normal. The suite includes exponential backoff retries for 429 rate limits. Expect 3-5 minutes for 150 candidates on dev.
 
+### `load:10` exits non-zero despite 100% checks
 
-### Browser reports `ERR_NAME_NOT_RESOLVED` for the activity cover
-
-The old `cdn.symulate.ai` placeholder is no longer hardcoded. Configure a reachable image URL if your environment uses a different asset host:
-
-```env
-ACTIVITY_IMAGE_URL=https://symulate-ai-dev.weuno.co/favicon.ico
-```
-
-
-### `load:10` completes 10/10 iterations but exits with threshold errors
-
-If the summary shows `checks=100%`, `http_req_failed=0%`, `managed_clients_created=10` and `managed_projects_created=10`, the functional load flow completed successfully. A non-zero exit can still be caused by latency SLO thresholds.
-
-Use the default:
-
-```env
-PERFORMANCE_PROFILE=auto
-```
-
-which resolves to the concurrency-aware `baseline` profile in load mode. Use `PERFORMANCE_PROFILE=strict` when you intentionally want the tighter low-concurrency latency budget to fail the run. Do not use `functional` for performance sign-off; it is only for isolating correctness from latency.
+A latency threshold was crossed. Set `PERFORMANCE_PROFILE=baseline` or `PERFORMANCE_PROFILE=functional` for dev environment runs.
 
 ### `CommonProgramFiles(x86)` k6 error
 
-The runners forward only project variables from `.env`, not the entire Windows process environment. If this returns, run:
+Runners forward only `.env` variables to k6, not the full Windows environment. Run `npm run validate:e2e-runner` to diagnose.
 
-```bat
-npm run validate:e2e-runner
-```
+### `candidate session → 403 assessment has not started yet`
 
-### Candidate session returns `403 assessment has not started yet`
-
-Keep:
-
+Keep retry settings:
 ```env
 BOOKING_START_SETTLE_MS=3000
 SESSION_START_RETRY_ATTEMPTS=3
 SESSION_START_RETRY_DELAY_MS=2500
 ```
 
-The suite retries only the known transient booking/start propagation case.
+---
 
-## 18. Recommended production-like configuration
+## 18. Recommended Configurations
+
+### Quick smoke test (verify everything works)
 
 ```env
-SCENARIO=full
-LOAD_MODE=smoke
-LOAD_VUS=10
-LOAD_ITERATIONS_PER_VU=1
-NUM_CANDIDATES=20
-
-SEND_PROJECT_INVITATIONS=true
-SEND_CLIENT_EMAIL=true
-CANDIDATE_EXECUTION_SOURCE=auto
-
-ENFORCE_BOOKING=true
+NUM_CANDIDATES=10
+LOAD_VUS=1
+SEND_PROJECT_INVITATIONS=false
+ENFORCE_BOOKING=false
 ANAM_MODE=disabled
-ANUM_API_ENABLED=false
-
-HEADLESS=true
-PLAYWRIGHT_MICROPHONE_MODE=fake
 ```
 
-Then run:
-
 ```bat
-npm install
-npm run validate
-npm run discover
 npm run smoke
 ```
 
-For isolated 10-project load:
+### Verify 10 concurrent users (development check)
 
-```bat
-npm run load:10
+```env
+NUM_CANDIDATES=10
+LOAD_VUS=10
+LOAD_MAX_DURATION=10m
+SEND_PROJECT_INVITATIONS=false
+ENFORCE_BOOKING=false
 ```
 
-For Anam outage validation, run:
+```bat
+npm run load:shared
+```
+
+### Full 150 concurrent users (load test)
+
+```env
+NUM_CANDIDATES=150
+LOAD_VUS=150
+LOAD_MAX_DURATION=30m
+SEND_PROJECT_INVITATIONS=false
+ENFORCE_BOOKING=false
+PERFORMANCE_PROFILE=baseline
+```
 
 ```bat
-npm run validate:e2e-runner
+npm run load:shared
+```
+
+> Phase 1 (~3-5 min) provisions 150 candidates. Phase 2 fires 150 VUs simultaneously — each performs all 6 activities against the same project.
+
+### Anam outage validation
+
+```env
+NUM_CANDIDATES=10
+SEND_PROJECT_INVITATIONS=true
+ANAM_MODE=outage503
+SIMULATE_ANAM_MID_SESSION_OUTAGE=true
+ANAM_OUTAGE_AUTO_RECOVER=true
+ANAM_OUTAGE_RECOVER_AFTER_MS=15000
+```
+
+```bat
 npm run e2e:anam:outage503
 ```
 
-Those specialized E2E npm commands enable invitations only for their isolated E2E project. Your `.env` value remains unchanged for normal smoke/load runs.
-# Symulate-Prod-LoadTest
-# Symulate-Prod-LoadTest
+### With live Grafana monitoring
+
+```bat
+npm run monitoring:up
+npm run load:shared
+```
+
+Access dashboard at `http://localhost:3000`.
+
+---
+
+## Architecture Notes
+
+### Why invitation-href login (not email+password)?
+
+The dev environment's `portal-tokens` API (`/auth/candidate/portal-tokens`) returns 404. Invitation hrefs embed a signed `access_token` in the URL query string. The suite parses this token from the href and uses it directly — no password required, no portal-tokens call needed.
+
+### Why temp file for hrefs (not CLI args)?
+
+With 150 candidates, the base64-encoded hrefs JSON exceeds 4000 characters. Windows has a CLI argument length limit (ENAMETOOLONG). The runner writes the hrefs to a temp `.b64` file and passes the file path as `SHARED_CANDIDATE_HREFS_FILE`. k6's `open()` reads the file at init time.
+
+### Why shared-project for concurrent load?
+
+Isolated load (one project per VU) triggers 150 concurrent `Create Client` API calls → mass 429 rate limiting. Shared-project load uses 1 provisioning operation then fires all VUs against the same project — matching real-world usage where many candidates work in one hiring project simultaneously.
