@@ -54,8 +54,8 @@ function buildHtml(runDir, summary) {
     s.steps,
     (x) =>
       `<tr><td>${esc(x.name)}</td><td style="color:${x.ok ? '#0a7d2c' : '#b3261e'};font-weight:600">${x.ok ? 'OK' : 'FAIL'}</td>` +
-      `<td>${esc(x.note || '')}</td><td>${x.screenshot ? `<a href="${esc(path.relative(runDir, x.screenshot))}" target="_blank">view</a>` : ''}</td></tr>`,
-    4,
+      `<td>${esc(x.note || '')}</td></tr>`,
+    3,
     'No steps'
   );
 
@@ -132,7 +132,7 @@ th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top}t
 </table>
 
 <h2>Flow steps</h2>
-<table><tr><th>Step</th><th>Status</th><th>Note</th><th>Screenshot</th></tr>${stepsRows}</table>
+<table><tr><th>Step</th><th>Status</th><th>Note</th></tr>${stepsRows}</table>
 
 <h2>Anam HTTP requests observed</h2>
 <table><tr><th>When</th><th>Method</th><th>Status</th><th>Phase</th><th>URL</th></tr>${anamRows}</table>

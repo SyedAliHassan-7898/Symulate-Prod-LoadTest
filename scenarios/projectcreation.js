@@ -10,7 +10,7 @@
 
 import { check } from 'k6';
 import { sleep } from 'k6';
-import { getJson, postJson, patchJson, extractId } from '../utils/http.js';
+import { getJson, postJson, patchJson, extractId, extractToken } from '../utils/http.js';
 import { log, logStep, uniqueSuffix } from '../utils/helpers.js';
 import { routes } from '../utils/routes.js';
 import { superAdminLogin, impersonateClientAdmin } from './login.js';
@@ -25,7 +25,9 @@ const candidateTemplates = parseCandidatesCsv(candidatesCsvTemplate);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function normalizeAnamMode(mode = __ENV.ANAM_MODE) {
-  const raw = String(mode || '').trim().toLowerCase();
+  const raw = String(mode || '')
+    .trim()
+    .toLowerCase();
   if (raw === 'disabled' || raw === 'healthy' || raw === 'outage503' || raw === 'network') return raw;
   return ANUM_API_ENABLED ? 'healthy' : 'disabled';
 }
@@ -44,11 +46,11 @@ export function configureTalentIntelligenceForMode(superAdminToken, orgId, mode 
     routes.organizationById(orgId),
     { enableTalentIntelligence: enabled },
     superAdminToken,
-    `Configure Talent Intelligence (${normalizedMode})`
+    `Configure Talent Intelligence (${normalizedMode})`,
   );
   logStep(`Configure Talent Intelligence (${normalizedMode})`, res);
   check(res, {
-    [`configure talent intelligence (${normalizedMode}): status 2xx`]: (r) => r.status >= 200 && r.status < 300
+    [`configure talent intelligence (${normalizedMode}): status 2xx`]: (r) => r.status >= 200 && r.status < 300,
   });
   return { enabled, mode: normalizedMode, response: res };
 }
@@ -57,7 +59,7 @@ export function createProject(clientToken, orgId) {
   const suffix = uniqueSuffix();
   const payload = {
     title: `Candidate Perform with timer ${suffix}`,
-    description: ''
+    description: '',
   };
 
   const res = postJson(routes.createProject(orgId), payload, clientToken, 'Create Project');
@@ -65,46 +67,9 @@ export function createProject(clientToken, orgId) {
   const projectId = extractId(res, 'id');
   check(res, {
     'create project: status 2xx': (r) => r.status >= 200 && r.status < 300,
-    'create project: id returned': () => !!projectId
+    'create project: id returned': () => !!projectId,
   });
   return projectId;
-}
-
-export function configureProjectAvailability(clientToken, projectId) {
-  // Keep the generated project inside an open availability window regardless
-  // of the machine timezone (developer laptop, CI runner, Docker, etc.).
-  // The previous fixed local-time 11:00 window could create projects whose
-  // booking window was not open when the candidate immediately reached /booking.
-  const nowMs = Date.now();
-  const start = new Date(nowMs - (5 * 60 * 1000));
-  const end = new Date(nowMs + (48 * 60 * 60 * 1000));
-
-  // Keep timestamps deterministic to the minute; booking slots are minute based.
-  start.setUTCSeconds(0, 0);
-  end.setUTCSeconds(0, 0);
-
-  const payload = {
-    availabilityStart: start.toISOString(),
-    availabilityEnd: end.toISOString()
-    // NOTE: The fields below are managed by Super Admin at organisation level
-    // and must NOT be sent from this client-admin-scoped script.
-    // maxAssessmentDurationMinutes: 105,
-    // durationBufferMinutes: 15,
-    // minimumLeadTimeMinutes: 0,
-    // slotIntervalMinutes: 15,
-    // slotIntervalMinutesQuiet: 1,
-    // anamHardLimit: 100,
-    // bookingCapacityPercent: 70,
-    // rescheduleCutoffMinutes: 30,
-    // noShowGracePeriodMinutes: 15
-  };
-
-  const res = postJson(routes.projectAvailabilityConfig(projectId), payload, clientToken, 'Configure Project Availability');
-  logStep('Configure Project Availability', res);
-  check(res, {
-    'configure project availability: status 2xx': (r) => r.status >= 200 && r.status < 300
-  });
-  return res;
 }
 
 export function assignRoleProfileToProject(clientToken, projectId, roleProfileId) {
@@ -113,7 +78,7 @@ export function assignRoleProfileToProject(clientToken, projectId, roleProfileId
   logStep('Assign Role Profile to Project', res);
   check(res, {
     'assign role profile to project: status 2xx': (r) => r.status >= 200 && r.status < 300,
-    'assign role profile to project: role profile returned': (r) => hasNestedId(r, 'roleProfile', roleProfileId)
+    'assign role profile to project: role profile returned': (r) => hasNestedId(r, 'roleProfile', roleProfileId),
   });
   return res;
 }
@@ -122,38 +87,34 @@ export function createProjectStage(clientToken, projectId) {
   const payload = {
     name: 'Stage 1',
     sequence: 1,
-    projectId
+    projectId,
   };
   const res = postJson(routes.stages(), payload, clientToken, 'Create Project Stage');
   logStep('Create Project Stage', res);
   const stageId = extractId(res, 'id');
   check(res, {
     'create project stage: status 2xx': (r) => r.status >= 200 && r.status < 300,
-    'create project stage: id returned': () => !!stageId
+    'create project stage: id returned': () => !!stageId,
   });
   return stageId;
 }
 
 export function assignActivitiesToStage(clientToken, stageId, activities) {
   const source = Array.isArray(activities) ? activities : [];
-  const assignableActivities = source.filter(
-    (activity) => activity && activity.activityId && UUID_RE.test(String(activity.activityId))
-  );
-  const skippedActivities = source.filter(
-    (activity) => !activity || !activity.activityId || !UUID_RE.test(String(activity.activityId))
-  );
+  const assignableActivities = source.filter((activity) => activity && activity.activityId && UUID_RE.test(String(activity.activityId)));
+  const skippedActivities = source.filter((activity) => !activity || !activity.activityId || !UUID_RE.test(String(activity.activityId)));
 
   if (skippedActivities.length) {
-    log(
-      'Project Creation',
-      `Skipping ${skippedActivities.length} activity record(s) without a valid activity ID before stage assignment`
-    );
+    log('Project Creation', `Skipping ${skippedActivities.length} activity record(s) without a valid activity ID before stage assignment`);
   }
 
   const welcomeCount = assignableActivities.filter((activity) => activity.type === 'WELCOME').length;
-  const dependencyReady = check({ welcomeCount }, {
-    'assign activities to stage: exactly one Welcome activity is present': (value) => value.welcomeCount === 1
-  });
+  const dependencyReady = check(
+    { welcomeCount },
+    {
+      'assign activities to stage: exactly one Welcome activity is present': (value) => value.welcomeCount === 1,
+    },
+  );
 
   if (!dependencyReady) {
     const body = `Stage dependency validation failed: expected exactly one Welcome activity, resolved ${welcomeCount}.`;
@@ -162,30 +123,45 @@ export function assignActivitiesToStage(clientToken, stageId, activities) {
   }
 
   const payload = {
-    assignments: [{
-      stageId,
-      activityIds: assignableActivities.map((activity) => activity.activityId)
-    }]
+    assignments: [
+      {
+        stageId,
+        activityIds: assignableActivities.map((activity) => activity.activityId),
+      },
+    ],
   };
   const res = postJson(routes.assignStageActivitiesBulk(), payload, clientToken, 'Assign Activities to Stage');
   logStep('Assign Activities to Stage', res);
   check(res, {
     'assign activities to stage: status 2xx': (r) => r.status >= 200 && r.status < 300,
-    'assign activities to stage: all activities assigned': (r) => responseListFromRes(r).length === assignableActivities.length
+    'assign activities to stage: all activities assigned': (r) => responseListFromRes(r).length === assignableActivities.length,
   });
   return res;
 }
 
-export function getDefaultEmailTemplate(clientToken) {
-  const res = getJson(routes.emailTemplates(), clientToken, 'Get Email Templates');
+export function getDefaultEmailTemplate(clientToken, templateId = null) {
+  // Retry on 429 rate-limit
+  let res;
+  const maxRetries = 5;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    res = getJson(routes.emailTemplates(), clientToken, 'Get Email Templates');
+    if (res.status !== 429) break;
+    const waitSec = attempt * 3;
+    log('Email Template', `[RETRY] Get Email Templates — 429 rate limited, retry ${attempt}/${maxRetries} after ${waitSec}s`);
+    sleep(waitSec);
+  }
+
   logStep('Get Email Templates', res);
   const templates = responseListFromRes(res);
-  const template = templates.find((item) => item.isSystemDefault) || templates[0] || null;
+  const template =
+    (templateId && templates.find((item) => item.id === templateId)) || templates.find((item) => item.isSystemDefault) || templates[0] || null;
   const emailTemplateId = template && template.id;
+  getDefaultEmailTemplate.lastBody = template && String(template.body || '');
+  log('Email Template', `Selected templateId=${emailTemplateId || 'NONE'}, bodyLength=${(getDefaultEmailTemplate.lastBody || '').length}`);
 
   check(res, {
     'get email templates: status 2xx': (r) => r.status >= 200 && r.status < 300,
-    'get email templates: template id returned': () => !!emailTemplateId
+    'get email templates: template id returned': () => !!emailTemplateId,
   });
 
   return emailTemplateId;
@@ -198,26 +174,23 @@ export function getProjectById(clientToken, projectId, stepName = 'Get Project B
 
   check(res, {
     [`${stepName.toLowerCase()}: status 2xx`]: (r) => r.status >= 200 && r.status < 300,
-    [`${stepName.toLowerCase()}: project returned`]: () => !!(project && project.id === projectId)
+    [`${stepName.toLowerCase()}: project returned`]: () => !!(project && project.id === projectId),
   });
 
   return project;
 }
 
-export function sendInvitationsToProjectCandidates(
-  clientToken,
-  projectId,
-  emailTemplateId,
-  candidateIds = [],
-  candidateEmails = []
-) {
+export function sendInvitationsToProjectCandidates(clientToken, projectId, emailTemplateId, candidateIds = [], candidateEmails = []) {
   const assignedCandidateIds = Array.isArray(candidateIds) ? candidateIds.filter(Boolean) : [];
   const assignedCandidateEmails = Array.isArray(candidateEmails) ? candidateEmails.filter(Boolean) : [];
-  const preconditionsReady = check({ projectId, emailTemplateId, candidateCount: assignedCandidateIds.length }, {
-    'send project invitations: project id available': (value) => !!value.projectId,
-    'send project invitations: email template selected': (value) => !!value.emailTemplateId,
-    'send project invitations: at least one candidate assigned': (value) => value.candidateCount > 0
-  });
+  const preconditionsReady = check(
+    { projectId, emailTemplateId, candidateCount: assignedCandidateIds.length },
+    {
+      'send project invitations: project id available': (value) => !!value.projectId,
+      'send project invitations: email template selected': (value) => !!value.emailTemplateId,
+      'send project invitations: at least one candidate assigned': (value) => value.candidateCount > 0,
+    },
+  );
 
   if (!preconditionsReady) {
     const body = 'Project invitation preconditions failed: project, email template, and assigned candidates are required.';
@@ -225,12 +198,10 @@ export function sendInvitationsToProjectCandidates(
     return { status: 0, body, timings: { duration: 0 } };
   }
 
-  const recipientText = assignedCandidateEmails.length
-    ? ` Recipients: ${assignedCandidateEmails.join(', ')}`
-    : '';
+  const recipientText = assignedCandidateEmails.length ? ` Recipients: ${assignedCandidateEmails.join(', ')}` : '';
   log(
     'Project Invitations',
-    `Sending project invitation email to ${assignedCandidateIds.length} assigned candidate(s) for project ${projectId}.${recipientText}`
+    `Sending project invitation email to ${assignedCandidateIds.length} assigned candidate(s) for project ${projectId}.${recipientText}`,
   );
 
   // The backend endpoint sends the selected template to all candidates already
@@ -239,7 +210,8 @@ export function sendInvitationsToProjectCandidates(
   // payload because the confirmed contract accepts projectId + emailTemplateId.
   const payload = {
     projectId,
-    emailTemplateId
+    emailTemplateId,
+    extractToken,
   };
   const res = postJson(routes.sendProjectCandidateInvitations(), payload, clientToken, 'Send Project Candidate Invitations');
   logStep('Send Project Candidate Invitations', res);
@@ -248,7 +220,7 @@ export function sendInvitationsToProjectCandidates(
   const message = String((body && (body.message || (body.data && body.data.message))) || '');
   check(res, {
     'send project invitations: status 2xx': (r) => r.status >= 200 && r.status < 300,
-    'send project invitations: backend confirmed email dispatch': () => /email sent successfully/i.test(message)
+    'send project invitations: backend confirmed email dispatch': () => /email sent successfully/i.test(message),
   });
   return res;
 }
@@ -259,7 +231,7 @@ export function createAndAssignCandidatesFromCsvSeed(clientToken, projectId, org
 
   log(
     'Candidate Provisioning',
-    `Creating ${expectedCandidates.length} project candidate(s) from data/candidates.csv using the confirmed create-for-project API.`
+    `Creating ${expectedCandidates.length} project candidate(s) from data/candidates.csv using the confirmed create-for-project API.`,
   );
 
   expectedCandidates.forEach((candidate, index) => {
@@ -267,82 +239,81 @@ export function createAndAssignCandidatesFromCsvSeed(clientToken, projectId, org
       organizationId,
       name: candidate.name,
       email: candidate.email,
-      force: false
+      force: false,
     };
 
     const step = `Create Project Candidate ${index + 1}/${expectedCandidates.length}`;
-    const res = postJson(routes.createCandidateForProject(projectId), payload, clientToken, step);
+
+    // Retry on 429 rate-limit with exponential backoff
+    let res;
+    const maxRetries = 5;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      res = postJson(routes.createCandidateForProject(projectId), payload, clientToken, step);
+      if (res.status !== 429) break;
+      const waitSec = attempt * 3; // 3s, 6s, 9s, 12s, 15s
+      log('Candidate Provisioning', `[RETRY] ${step} — 429 rate limited, retry ${attempt}/${maxRetries} after ${waitSec}s`);
+      sleep(waitSec);
+    }
+
     logStep(`${step} (${candidate.email})`, res);
     const candidateId = extractCandidateId(res);
 
     check(res, {
       [`${step}: status 2xx`]: (r) => r.status >= 200 && r.status < 300,
-      [`${step}: candidate id returned`]: () => !!candidateId
+      [`${step}: candidate id returned`]: () => !!candidateId,
     });
 
     if (!candidateId) {
       throw new Error(
-        `Candidate provisioning failed for ${candidate.email}: create-for-project did not return a candidate ID (status=${res.status}).`
+        `Candidate provisioning failed for ${candidate.email}: create-for-project did not return a candidate ID (status=${res.status}).`,
       );
     }
 
     candidateIds.push(candidateId);
-    sleep(0.1);
+    // Pace requests to avoid rate limiting — 300ms between candidates
+    sleep(0.3);
   });
 
   if (candidateIds.length !== expectedCandidates.length) {
-    throw new Error(
-      `Candidate provisioning failed: expected ${expectedCandidates.length} candidate IDs, resolved ${candidateIds.length}.`
-    );
+    throw new Error(`Candidate provisioning failed: expected ${expectedCandidates.length} candidate IDs, resolved ${candidateIds.length}.`);
   }
 
-  const assignRes = postJson(
-    routes.bulkAssignCandidatesToProject(projectId),
-    { candidateIds },
-    clientToken,
-    'Bulk Assign Candidates to Project'
-  );
+  const assignRes = postJson(routes.bulkAssignCandidatesToProject(projectId), { candidateIds }, clientToken, 'Bulk Assign Candidates to Project');
   logStep('Bulk Assign Candidates to Project', assignRes);
   const assigned = check(assignRes, {
-    'bulk assign candidates to project: status 2xx': (r) => r.status >= 200 && r.status < 300
+    'bulk assign candidates to project: status 2xx': (r) => r.status >= 200 && r.status < 300,
   });
 
   if (!assigned) {
     throw new Error(`Bulk candidate assignment failed for project ${projectId} (status=${assignRes.status}).`);
   }
 
-  const verified = waitForAssignedProjectCandidates(
-    clientToken,
-    projectId,
-    expectedCandidates,
-    12,
-    750
-  );
+  const verified = waitForAssignedProjectCandidates(clientToken, projectId, expectedCandidates, 12, 750);
 
   if (!verified.ok) {
     throw new Error(
       `Project candidate verification failed: expected ${expectedCandidates.length} assigned candidates, ` +
-      `matched ${verified.matchedCount}. Missing: ${verified.missingEmails.join(', ')}`
+        `matched ${verified.matchedCount}. Missing: ${verified.missingEmails.join(', ')}`,
     );
   }
 
   log(
     'Candidate Provisioning',
-    `Candidate provisioning complete: ${verified.matchedCount}/${expectedCandidates.length} candidates assigned to project ${projectId}.`
+    `Candidate provisioning complete: ${verified.matchedCount}/${expectedCandidates.length} candidates assigned to project ${projectId}.`,
   );
 
   return candidateIds;
 }
 
-export function waitForAssignedProjectCandidates(
-  clientToken,
-  projectId,
-  expectedCandidates,
-  maxAttempts = 12,
-  delayMs = 750
-) {
+export function waitForAssignedProjectCandidates(clientToken, projectId, expectedCandidates, maxAttempts = 12, delayMs = 750) {
   const expected = Array.isArray(expectedCandidates) ? expectedCandidates : [];
-  const expectedEmails = new Set(expected.map((candidate) => String(candidate.email || '').trim().toLowerCase()));
+  const expectedEmails = new Set(
+    expected.map((candidate) =>
+      String(candidate.email || '')
+        .trim()
+        .toLowerCase(),
+    ),
+  );
   let matched = [];
   let lastStatus = 0;
 
@@ -355,7 +326,7 @@ export function waitForAssignedProjectCandidates(
 
     log(
       'Candidate Provisioning',
-      `Assignment verification ${attempt}/${maxAttempts}: ${matched.length}/${expected.length} expected candidates visible on project ${projectId}.`
+      `Assignment verification ${attempt}/${maxAttempts}: ${matched.length}/${expected.length} expected candidates visible on project ${projectId}.`,
     );
 
     if (res.status >= 200 && res.status < 300 && matched.length === expected.length) {
@@ -367,13 +338,20 @@ export function waitForAssignedProjectCandidates(
 
   const matchedEmails = new Set(matched.map(candidateEmailFromRecord).filter(Boolean));
   const missingEmails = expected
-    .map((candidate) => String(candidate.email || '').trim().toLowerCase())
+    .map((candidate) =>
+      String(candidate.email || '')
+        .trim()
+        .toLowerCase(),
+    )
     .filter((email) => email && !matchedEmails.has(email));
 
-  check({ lastStatus, matchedCount: matched.length, expectedCount: expected.length }, {
-    'project candidates: project lookup status 2xx': (value) => value.lastStatus >= 200 && value.lastStatus < 300,
-    'project candidates: all CSV-seed candidates assigned': (value) => value.matchedCount === value.expectedCount
-  });
+  check(
+    { lastStatus, matchedCount: matched.length, expectedCount: expected.length },
+    {
+      'project candidates: project lookup status 2xx': (value) => value.lastStatus >= 200 && value.lastStatus < 300,
+      'project candidates: all CSV-seed candidates assigned': (value) => value.matchedCount === value.expectedCount,
+    },
+  );
 
   return { ok: false, matchedCount: matched.length, missingEmails, records: matched };
 }
@@ -387,12 +365,9 @@ function candidateEntity(record) {
 
 function candidateEmailFromRecord(record) {
   const entity = candidateEntity(record);
-  return String(
-    entity.email ||
-    record.email ||
-    (record.candidate && record.candidate.email) ||
-    ''
-  ).trim().toLowerCase();
+  return String(entity.email || record.email || (record.candidate && record.candidate.email) || '')
+    .trim()
+    .toLowerCase();
 }
 
 function extractCandidateId(res) {
@@ -421,22 +396,15 @@ export function verifyProjectActive(clientToken, projectId, expectedCount = 1) {
   for (let attempt = 1; attempt <= 10; attempt += 1) {
     project = getProjectById(clientToken, projectId, 'Verify Active Project');
     const candidateCount = project && Array.isArray(project.candidates) ? project.candidates.length : 0;
-    const candidateAccessFlag = project && Object.prototype.hasOwnProperty.call(project, 'candidateAccess')
-      ? project.candidateAccess
-      : 'UNAVAILABLE';
+    const candidateAccessFlag = project && Object.prototype.hasOwnProperty.call(project, 'candidateAccess') ? project.candidateAccess : 'UNAVAILABLE';
 
     log(
       'Project Activation',
       `Verification ${attempt}/10: status=${project && project.status ? project.status : 'UNKNOWN'}, ` +
-      `candidateAccessFlag=${candidateAccessFlag} (diagnostic only), candidates=${candidateCount}/${expectedCount}.`
+        `candidateAccessFlag=${candidateAccessFlag} (diagnostic only), candidates=${candidateCount}/${expectedCount}.`,
     );
 
-    if (
-      project &&
-      project.status === 'ACTIVE' &&
-      project.emailTemplateId &&
-      candidateCount >= expectedCount
-    ) {
+    if (project && project.status === 'ACTIVE' && project.emailTemplateId && candidateCount >= expectedCount) {
       break;
     }
 
@@ -446,8 +414,7 @@ export function verifyProjectActive(clientToken, projectId, expectedCount = 1) {
   check(project || {}, {
     'project active: status ACTIVE': () => project && project.status === 'ACTIVE',
     'project active: email template selected': () => project && !!project.emailTemplateId,
-    'project active: candidates assigned': () =>
-      project && Array.isArray(project.candidates) && project.candidates.length >= expectedCount
+    'project active: candidates assigned': () => project && Array.isArray(project.candidates) && project.candidates.length >= expectedCount,
   });
 
   return project;
@@ -461,17 +428,14 @@ export function completeProjectCreationFlow(clientToken, projectOrgId, roleProfi
   if (requestedCount > candidateTemplates.length) {
     throw new Error(
       `NUM_CANDIDATES=${requestedCount} exceeds the ${candidateTemplates.length} candidate rows available in data/candidates.csv. ` +
-      'Add more seed rows or lower NUM_CANDIDATES.'
+        'Add more seed rows or lower NUM_CANDIDATES.',
     );
   }
 
   const candidateCount = requestedCount;
   const runCandidates = buildRunCandidates(candidateCount, options.candidateSuffix || uniqueSuffix());
 
-  log(
-    'Project Creation',
-    `Creating isolated project data for VU ${__VU}, iteration ${__ITER}: ${candidateCount} unique candidate(s)`
-  );
+  log('Project Creation', `Creating isolated project data for VU ${__VU}, iteration ${__ITER}: ${candidateCount} unique candidate(s)`);
 
   getJson(routes.organizationsList(), clientToken, 'Get Accounts');
   getJson(routes.roleProfilesList(), clientToken, 'Get Role Profiles');
@@ -479,7 +443,6 @@ export function completeProjectCreationFlow(clientToken, projectOrgId, roleProfi
 
   const projectId = createProject(clientToken, projectOrgId);
   if (roleProfileId) assignRoleProfileToProject(clientToken, projectId, roleProfileId);
-  configureProjectAvailability(clientToken, projectId);
 
   getJson(routes.bandsList(), clientToken, 'Get Bands');
   getJson(routes.activitiesList(), clientToken, 'Get Activities for Project Setup');
@@ -487,17 +450,10 @@ export function completeProjectCreationFlow(clientToken, projectOrgId, roleProfi
   const stageId = createProjectStage(clientToken, projectId);
   assignActivitiesToStage(clientToken, stageId, activities);
 
-  const candidateIds = createAndAssignCandidatesFromCsvSeed(
-    clientToken,
-    projectId,
-    projectOrgId,
-    runCandidates
-  );
+  const candidateIds = createAndAssignCandidatesFromCsvSeed(clientToken, projectId, projectOrgId, runCandidates);
 
   if (candidateIds.length !== candidateCount) {
-    throw new Error(
-      `Project candidate provisioning failed: expected ${candidateCount} candidates, resolved ${candidateIds.length}.`
-    );
+    throw new Error(`Project candidate provisioning failed: expected ${candidateCount} candidates, resolved ${candidateIds.length}.`);
   }
 
   let emailTemplateId = null;
@@ -505,13 +461,16 @@ export function completeProjectCreationFlow(clientToken, projectOrgId, roleProfi
   let activeProject = null;
 
   if (SEND_PROJECT_INVITATIONS) {
-    emailTemplateId = getDefaultEmailTemplate(clientToken);
+    // The project detail is the source of truth for the selected template.
+    const projectBeforeInvitation = getProjectById(clientToken, projectId, 'Get Project Details (Email Template)');
+    const projectTemplateId = projectBeforeInvitation && projectBeforeInvitation.emailTemplateId;
+    emailTemplateId = getDefaultEmailTemplate(clientToken, projectTemplateId);
     invitationResponse = sendInvitationsToProjectCandidates(
       clientToken,
       projectId,
       emailTemplateId,
       candidateIds,
-      runCandidates.map((candidate) => candidate.email)
+      runCandidates.map((candidate) => candidate.email),
     );
 
     if (!invitationResponse || invitationResponse.status < 200 || invitationResponse.status >= 300) {
@@ -525,16 +484,37 @@ export function completeProjectCreationFlow(clientToken, projectOrgId, roleProfi
   } else {
     log(
       'Project Invitations',
-      'SEND_PROJECT_INVITATIONS=false: invitation dispatch is disabled. The managed project remains provisioning-only and candidate activities must not start.'
+      'SEND_PROJECT_INVITATIONS=false: invitation dispatch is disabled. The managed project remains provisioning-only and candidate activities must not start.',
     );
     activeProject = getProjectById(clientToken, projectId, 'Get Provisioned Project');
   }
 
-  const invitationSent = !!(
-    invitationResponse &&
-    invitationResponse.status >= 200 &&
-    invitationResponse.status < 300
-  );
+  const invitationSent = !!(invitationResponse && invitationResponse.status >= 200 && invitationResponse.status < 300);
+
+  // Extract per-candidate invitation hrefs from the bulk invitation response.
+  // The API returns accessMyPortal as an array when multiple candidates are invited.
+  // Store all hrefs indexed by candidateId so downstream phases can login without re-dispatching.
+  const allInvitationHrefs = {};
+  if (invitationResponse) {
+    try {
+      const invBody = parseResponseBody(invitationResponse);
+      const portalArray = invBody && (invBody.accessMyPortal || (invBody.data && invBody.data.accessMyPortal));
+      if (Array.isArray(portalArray)) {
+        portalArray.forEach((item) => {
+          if (item && item.accessMyPortal) {
+            // Index by both candidateId and email for flexible lookup.
+            if (item.candidateId) allInvitationHrefs[String(item.candidateId)] = item.accessMyPortal;
+            if (item.email) allInvitationHrefs[String(item.email).toLowerCase()] = item.accessMyPortal;
+          }
+        });
+      } else if (typeof portalArray === 'string' && portalArray) {
+        // Single-candidate invitation returns a plain string.
+        if (candidateIds[0]) allInvitationHrefs[String(candidateIds[0])] = portalArray;
+      }
+    } catch (e) {
+      // ignore — allInvitationHrefs stays empty
+    }
+  }
 
   return {
     projectId,
@@ -544,20 +524,47 @@ export function completeProjectCreationFlow(clientToken, projectOrgId, roleProfi
     candidateCount,
     emailTemplateId,
     invitationSent,
+    allInvitationHrefs,
+    invitationHref: extractInvitationHref(
+      invitationResponse,
+      candidateIds[0],
+      runCandidates[0] && runCandidates[0].email
+    ),
+    // Preserve rendered invitation content when the API returns it. The
+    // candidate flow extracts access_token from the email login href.
+    invitationBody:
+      invitationResponse && /access_token=/i.test(String(invitationResponse.body || ''))
+        ? invitationResponse.body
+        : getDefaultEmailTemplate.lastBody || '',
     projectStatus: activeProject && activeProject.status,
-    candidateExecutionAllowed: SEND_PROJECT_INVITATIONS && invitationSent && activeProject && activeProject.status === 'ACTIVE'
+    candidateExecutionAllowed: SEND_PROJECT_INVITATIONS && invitationSent && activeProject && activeProject.status === 'ACTIVE',
   };
 }
 
+export function extractInvitationHref(res, candidateId, candidateEmail) {
+  const body = parseResponseBody(res);
+  const value = body && (body.accessMyPortal || (body.data && body.data.accessMyPortal));
+  if (Array.isArray(value)) {
+    const match = value.find((item) =>
+      String(item && item.candidateId || '') === String(candidateId || '') ||
+      String(item && item.email || '').toLowerCase() === String(candidateEmail || '').toLowerCase()
+    );
+    return match && match.accessMyPortal ? match.accessMyPortal : '';
+  }
+  return typeof value === 'string' ? value : '';
+}
+
 function buildRunCandidates(count, suffix) {
-  const normalizedSuffix = String(suffix || uniqueSuffix()).replace(/[^a-zA-Z0-9]/g, '').slice(-28);
+  const normalizedSuffix = String(suffix || uniqueSuffix())
+    .replace(/[^a-zA-Z0-9]/g, '')
+    .slice(-28);
   return candidateTemplates.slice(0, count).map((candidate, index) => {
     const at = candidate.email.lastIndexOf('@');
     const local = at >= 0 ? candidate.email.slice(0, at) : `candidate${index + 1}`;
     const domain = at >= 0 ? candidate.email.slice(at + 1) : 'yopmail.com';
     return {
       name: `${candidate.name} Load ${__VU}-${__ITER}`,
-      email: `${local}.load.${normalizedSuffix}.${index + 1}@${domain}`
+      email: `${local}.load.${normalizedSuffix}.${index + 1}@${domain}`,
     };
   });
 }
@@ -583,7 +590,10 @@ function parseResponseBody(res) {
 
 function parseCandidatesCsv(csv) {
   const lines = String(csv).trim().split(/\r?\n/);
-  const headers = lines.shift().split(',').map((header) => header.trim());
+  const headers = lines
+    .shift()
+    .split(',')
+    .map((header) => header.trim());
   const nameIndex = headers.indexOf('name');
   const emailIndex = headers.indexOf('email');
   return lines
@@ -591,7 +601,7 @@ function parseCandidatesCsv(csv) {
     .filter((columns) => columns[nameIndex] && columns[emailIndex])
     .map((columns) => ({
       name: columns[nameIndex],
-      email: columns[emailIndex]
+      email: columns[emailIndex],
     }));
 }
 

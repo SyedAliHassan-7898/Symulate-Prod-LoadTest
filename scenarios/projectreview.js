@@ -16,7 +16,7 @@ import { superAdminLogin, clientAdminLogin, impersonateClientAdmin } from './log
 
 const REVIEW_REASON = __ENV.PROJECT_REVIEW_REASON || 'good';
 const REVIEW_SCORE_OVERRIDE = __ENV.PROJECT_REVIEW_SCORE ? Number(__ENV.PROJECT_REVIEW_SCORE) : null;
-const DEFAULT_REVIEW_CLIENT_ADMIN_USER_ID = 'd782f765-9d74-43c5-a268-e99e8246ac55';
+const DEFAULT_REVIEW_CLIENT_ADMIN_USER_ID = __ENV.CLIENT_ADMIN_USER_ID;
 const CLIENT_ADMIN_HEADERS = {
   'x-base-origin': 'client-admin',
   Origin: PORTALS.clientAdmin,

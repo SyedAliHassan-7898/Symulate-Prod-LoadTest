@@ -37,7 +37,7 @@ import { check, sleep } from 'k6';
 import { getJson, getJsonWithHeaders, postJson, postJsonWithHeaders, patchJson, extractId } from '../utils/http.js';
 import { log, logStep } from '../utils/helpers.js';
 import { routes } from '../utils/routes.js';
-import { candidateLogin, candidatePortalTokenLogin } from './login.js';
+import { candidateLogin } from './login.js';
 import { runTranscriptConversation } from '../utils/socketConversation.js';
 import { buildConversationTurns, buildSituationTurn } from '../data/conversationScripts.js';
 import { ANUM_API_ENABLED, HARDCODED_PROJECT_ID, API_URL } from '../config/environments.js';
@@ -45,13 +45,10 @@ import { ANUM_API_ENABLED, HARDCODED_PROJECT_ID, API_URL } from '../config/envir
 const BOOKING_START_SETTLE_MS = Math.max(0, Number(__ENV.BOOKING_START_SETTLE_MS || 3000));
 const SESSION_START_RETRY_ATTEMPTS = Math.max(1, Number(__ENV.SESSION_START_RETRY_ATTEMPTS || 3));
 const SESSION_START_RETRY_DELAY_MS = Math.max(250, Number(__ENV.SESSION_START_RETRY_DELAY_MS || 2500));
+const ENFORCE_BOOKING = String(__ENV.ENFORCE_BOOKING || 'false').toLowerCase() !== 'false';
 
 export function getAssignedActivities(candidateToken, candidateId, organizationId, projectId = HARDCODED_PROJECT_ID) {
-  const res = getJson(
-    routes.assignedActivities(projectId, organizationId),
-    candidateToken,
-    'Get Assigned Activities'
-  );
+  const res = getJson(routes.assignedActivities(projectId, organizationId), candidateToken, 'Get Assigned Activities');
   logStep('Get Assigned Activities', res);
   check(res, { 'get assigned activities: status 2xx': (r) => r.status >= 200 && r.status < 300 });
 
@@ -72,7 +69,7 @@ export function getAssignedActivities(candidateToken, candidateId, organizationI
           title: activity.title || activity.type,
           type: activity.type || sa.type,
           stageId: stage.id,
-          candidateId
+          candidateId,
         });
       });
     });
@@ -84,11 +81,7 @@ export function getAssignedActivities(candidateToken, candidateId, organizationI
 
 // Get activities from project details using admin token (fallback when candidate token fails)
 export function getActivitiesFromProject(adminToken, candidateId, projectId = HARDCODED_PROJECT_ID) {
-  const res = getJson(
-    routes.projectById(projectId),
-    adminToken,
-    'Get Project Details (Activities)'
-  );
+  const res = getJson(routes.projectById(projectId), adminToken, 'Get Project Details (Activities)');
   logStep('Get Project Details (Activities)', res);
   check(res, { 'get project details: status 2xx': (r) => r.status >= 200 && r.status < 300 });
 
@@ -109,7 +102,7 @@ export function getActivitiesFromProject(adminToken, candidateId, projectId = HA
           title: activity.title || activity.type,
           type: activity.type || sa.type,
           stageId: stage.id,
-          candidateId
+          candidateId,
         });
       });
     });
@@ -128,13 +121,18 @@ export function getHardcodedProjectCandidateId(adminToken, email, projectId = HA
     const data = body && body.data;
     const candidates =
       (data && (data.candidates || data.projectCandidates || data.items || data.rows || data.results || data.data)) ||
-      body.candidates || body.projectCandidates || body.items || body.rows || body.results || [];
+      body.candidates ||
+      body.projectCandidates ||
+      body.items ||
+      body.rows ||
+      body.results ||
+      [];
     const target = (Array.isArray(candidates) ? candidates : []).find((item) => {
       const candidate = item && (item.candidate || item.user || item.profile || item);
       return candidate && String(candidate.email || '').toLowerCase() === String(email || '').toLowerCase();
     });
     const candidate = target && (target.candidate || target.user || target.profile || target);
-    const resolvedId = target && (target.candidateId || target.userId || (candidate && (candidate.candidateId || candidate.id))) || null;
+    const resolvedId = (target && (target.candidateId || target.userId || (candidate && (candidate.candidateId || candidate.id)))) || null;
     return resolvedId;
   } catch (e) {
     return null;
@@ -147,11 +145,51 @@ export function acceptCandidateAgreement(candidateToken, candidateId, projectId 
     routes.acceptAgreement(candidateId, projectId),
     { isAgreementPolicyAccepted: true },
     candidateToken,
-    'Accept Candidate Agreement'
+    'Accept Candidate Agreement',
   );
   logStep('Accept Candidate Agreement', res);
   check(res, { 'accept agreement: status 2xx': (r) => r.status >= 200 && r.status < 300 });
   return res.status >= 200 && res.status < 300;
+}
+
+// Reads the candidate session from the rendered invitation email login href.
+// Expected href: app.symulate.ai/login?...&access_token=...&refresh_token=...
+export function candidateSessionFromInviteHref(emailHtml, expectedProjectId = null) {
+  const html = String(emailHtml || '');
+  const hrefs = html.match(/https?:\/\/[^\s"'<>]+\/login\?[^\s"'<>]+/gi) || (html.includes('access_token=') ? [html] : []);
+  const href =
+    hrefs.find((value) => {
+      const normalized = value.replace(/&amp;/gi, '&');
+      return !expectedProjectId || normalized.includes(`projectId=${expectedProjectId}`);
+    }) || hrefs[0];
+
+  if (!href) return null;
+
+  try {
+    const query = decodeURIComponent(href.replace(/&amp;/gi, '&')).split('?')[1] || '';
+    const params = {};
+    query.split('&').forEach((part) => {
+      const separator = part.indexOf('=');
+      if (separator > 0) params[part.slice(0, separator)] = part.slice(separator + 1);
+    });
+    if (!params.access_token) return null;
+    return {
+      token: params.access_token,
+      refreshToken: params.refresh_token || null,
+      projectId: params.projectId || expectedProjectId,
+      organizationId: params.organizationId || null,
+      parentOrganizationId: params.parentOrganizationId || null,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+export function getCandidatePortalTheme(candidateToken, parentOrganizationId) {
+  const res = getJson(routes.candidatePortalTheme(parentOrganizationId), candidateToken, 'Get Candidate Portal Theme');
+  logStep('Get Candidate Portal Theme', res);
+  check(res, { 'candidate portal theme: status 2xx': (r) => r.status >= 200 && r.status < 300 });
+  return res;
 }
 
 function responseData(res) {
@@ -164,6 +202,13 @@ function responseData(res) {
 }
 
 export function ensureCandidateBooking(candidateToken, projectId) {
+  // When ENFORCE_BOOKING=false (default), the dev environment has no booking
+  // API — skip all booking calls and proceed directly to activities.
+  if (!ENFORCE_BOOKING) {
+    log('Flow', `Booking gate disabled (ENFORCE_BOOKING=false); continuing with the existing activity session flow`);
+    return true;
+  }
+
   const candidateOrigin = __ENV.CANDIDATE_URL || 'https://symulate-ai-dev.weuno.co';
   const candidateHeaders = { Origin: candidateOrigin, Referer: `${candidateOrigin}/` };
 
@@ -192,14 +237,14 @@ export function ensureCandidateBooking(candidateToken, projectId) {
         'Flow',
         `Cannot continue: candidate is not assigned to project ${projectId} (backend: "${message}"). ` +
           'This is a data/assignment problem, not something a booking call or entry-check retry can fix — ' +
-          're-assign this candidate to the project before re-running.'
+          're-assign this candidate to the project before re-running.',
       );
       return false;
     }
   }
 
   check(bookingRes, {
-    'get candidate booking: status 2xx or no booking configured': (r) => (r.status >= 200 && r.status < 300) || r.status === 404
+    'get candidate booking: status 2xx or no booking configured': (r) => (r.status >= 200 && r.status < 300) || r.status === 404,
   });
 
   let booking = responseData(bookingRes);
@@ -232,7 +277,7 @@ export function ensureCandidateBooking(candidateToken, projectId) {
       routes.candidateBookingEntryCheck(projectId, new Date().toISOString()),
       candidateToken,
       'Booking Entry Check',
-      candidateHeaders
+      candidateHeaders,
     );
     logStep('Booking Entry Check', entryRes);
     const entry = responseData(entryRes) || {};
@@ -241,7 +286,7 @@ export function ensureCandidateBooking(candidateToken, projectId) {
       if (BOOKING_START_SETTLE_MS > 0) {
         log(
           'Flow',
-          `Booking entry gate is open for ${projectId}; waiting ${BOOKING_START_SETTLE_MS}ms for session services to observe the booked start time.`
+          `Booking entry gate is open for ${projectId}; waiting ${BOOKING_START_SETTLE_MS}ms for session services to observe the booked start time.`,
         );
         sleep(BOOKING_START_SETTLE_MS / 1000);
       }
@@ -260,7 +305,7 @@ export function ensureCandidateBooking(candidateToken, projectId) {
       log(
         'Flow',
         `entry-check says NO_ACTIVE_BOOKING (attempt ${noActiveBookingRetries}/${maxNoActiveBookingRetries}) for ${projectId} — ` +
-          'short bounded retry in case of replication lag, NOT an infinite retry.'
+          'short bounded retry in case of replication lag, NOT an infinite retry.',
       );
       sleep(2);
       continue;
@@ -282,7 +327,7 @@ function bookEarliestSlot(candidateToken, projectId, candidateHeaders, attempt =
   const slotsRes = getJsonWithHeaders(routes.candidateBookingSlots(projectId), candidateToken, 'Get Booking Slots', candidateHeaders);
   logStep('Get Booking Slots', slotsRes);
   check(slotsRes, {
-    'get booking slots: status 2xx': (r) => r.status >= 200 && r.status < 300
+    'get booking slots: status 2xx': (r) => r.status >= 200 && r.status < 300,
   });
 
   if (slotsRes.status === 404) {
@@ -305,13 +350,7 @@ function bookEarliestSlot(candidateToken, projectId, candidateHeaders, attempt =
 
   const slotStart = availableSlots[0].startAt;
   log('Flow', `Booking earliest available slot for ${projectId}: ${slotStart} (attempt ${attempt}/${maxAttempts})`);
-  const bookRes = postJsonWithHeaders(
-    routes.candidateBooking(projectId),
-    { slotStart },
-    candidateToken,
-    'Book Assessment Slot',
-    candidateHeaders
-  );
+  const bookRes = postJsonWithHeaders(routes.candidateBooking(projectId), { slotStart }, candidateToken, 'Book Assessment Slot', candidateHeaders);
   logStep('Book Assessment Slot', bookRes);
   check(bookRes, { 'book assessment slot: status 2xx': (r) => r.status >= 200 && r.status < 300 });
 
@@ -338,8 +377,12 @@ function bookEarliestSlot(candidateToken, projectId, candidateHeaders, attempt =
 
 function clientSessionId() {
   const timestamp = Date.now().toString(16).padStart(12, '0');
-  const vu = Number(__VU || 0).toString(16).padStart(4, '0');
-  const iteration = Number(__ITER || 0).toString(16).padStart(4, '0');
+  const vu = Number(__VU || 0)
+    .toString(16)
+    .padStart(4, '0');
+  const iteration = Number(__ITER || 0)
+    .toString(16)
+    .padStart(4, '0');
   return `${timestamp.slice(0, 8)}-${timestamp.slice(8)}00-${vu}0-${iteration}0000-000000000000`;
 }
 
@@ -356,16 +399,9 @@ export function startCandidateActivitySession(candidateToken, activity, projectI
 
   if (type === 'BOARD_MEETING') {
     const personaId =
-      (activity && activity.boardMeetingActivity && activity.boardMeetingActivity.id) ||
-      options.personaId ||
-      '30d457a4-5ef1-41ae-bb58-a144d48c0a00';
+      (activity && activity.boardMeetingActivity && activity.boardMeetingActivity.id) || options.personaId || '30d457a4-5ef1-41ae-bb58-a144d48c0a00';
 
-    return postJson(
-      routes.startBoardMeetingSession(activityId, personaId, projectId),
-      {},
-      candidateToken,
-      stepName
-    );
+    return postJson(routes.startBoardMeetingSession(activityId, personaId, projectId), {}, candidateToken, stepName);
   }
 
   return postJson(
@@ -374,10 +410,10 @@ export function startCandidateActivitySession(candidateToken, activity, projectI
       projectId,
       activityId,
       force,
-      clientSessionId: suppliedClientSessionId
+      // clientSessionId removed — this branch's DTO rejects unknown properties
     },
     candidateToken,
-    stepName
+    stepName,
   );
 }
 
@@ -399,12 +435,7 @@ function isBookedStartPropagationRace(res) {
 // backend paths. In the dev environment the entry-check can become true a few
 // seconds before the session-token guard observes the same booked start time.
 // Retry only that specific 403 race; all other errors are returned immediately.
-export function startCandidateActivitySessionWithRetry(
-  candidateToken,
-  activity,
-  projectId = HARDCODED_PROJECT_ID,
-  options = {}
-) {
+export function startCandidateActivitySessionWithRetry(candidateToken, activity, projectId = HARDCODED_PROJECT_ID, options = {}) {
   const maxAttempts = Math.max(1, Number(options.maxAttempts || SESSION_START_RETRY_ATTEMPTS));
   const retryDelayMs = Math.max(250, Number(options.retryDelayMs || SESSION_START_RETRY_DELAY_MS));
   const stableClientSessionId = options.clientSessionId || clientSessionId();
@@ -413,7 +444,7 @@ export function startCandidateActivitySessionWithRetry(
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     res = startCandidateActivitySession(candidateToken, activity, projectId, {
       ...options,
-      clientSessionId: stableClientSessionId
+      clientSessionId: stableClientSessionId,
     });
 
     if (!isBookedStartPropagationRace(res) || attempt >= maxAttempts) {
@@ -423,7 +454,7 @@ export function startCandidateActivitySessionWithRetry(
     log(
       'Flow',
       `${options.stepName || 'Start Candidate Activity Session'} returned the transient booked-start 403 ` +
-        `(attempt ${attempt}/${maxAttempts}). Waiting ${retryDelayMs}ms before retrying.`
+        `(attempt ${attempt}/${maxAttempts}). Waiting ${retryDelayMs}ms before retrying.`,
     );
     sleep(retryDelayMs / 1000);
   }
@@ -442,12 +473,7 @@ export function completeCandidateActivity(candidateToken, activityOrId, projectI
   }
 
   const endedAt = new Date().toISOString();
-  const res = patchJson(
-    routes.updateActivityStatus(activityId),
-    { status: 'COMPLETED', projectId, endedAt },
-    candidateToken,
-    stepName
-  );
+  const res = patchJson(routes.updateActivityStatus(activityId), { status: 'COMPLETED', projectId, endedAt }, candidateToken, stepName);
   logStep(`${stepName} (${activityId})`, res);
   check(res, { [`${stepName}: status 2xx`]: (r) => r.status >= 200 && r.status < 300 });
   return res;
@@ -477,7 +503,7 @@ export function submitActivity(candidateToken, candidateId, activity, candidateN
       clientSessionId: activityClientSessionId,
       stepName,
       personaId,
-      force: false
+      force: false,
     });
   }
 
@@ -494,12 +520,7 @@ export function submitActivity(candidateToken, candidateId, activity, candidateN
 
       if (activeActivityId) {
         log('SubmitActivity', `Active session detected for activity ${activeActivityId}; marking that activity COMPLETED before retry/continue`);
-        const staleCompleteRes = completeCandidateActivity(
-          candidateToken,
-          activeActivityId,
-          projectId,
-          'Complete Stale Active Activity'
-        );
+        const staleCompleteRes = completeCandidateActivity(candidateToken, activeActivityId, projectId, 'Complete Stale Active Activity');
 
         if (staleCompleteRes && staleCompleteRes.status >= 200 && staleCompleteRes.status < 300) {
           sleep(1);
@@ -510,14 +531,17 @@ export function submitActivity(candidateToken, candidateId, activity, candidateN
           if (String(activeActivityId) !== String(activityId)) {
             sessionRes = startSessionRequest();
           } else {
-            log('SubmitActivity', `${label}: stale session belonged to this same activity; cleanup completed it, so no duplicate restart is attempted`);
+            log(
+              'SubmitActivity',
+              `${label}: stale session belonged to this same activity; cleanup completed it, so no duplicate restart is attempted`,
+            );
             return {
               status: staleCompleteRes.status,
               skipped: false,
               transcriptConfirmed: false,
               linesAcked: 0,
               recoveredStaleSession: true,
-              completedByCleanup: true
+              completedByCleanup: true,
             };
           }
         }
@@ -559,7 +583,7 @@ export function submitActivity(candidateToken, candidateId, activity, candidateN
           const situations = body && body.data && body.data.situations;
           log(
             'Flow',
-            `SITUATIONS activity details loaded: status=${detailsRes.status}, situations=${Array.isArray(situations) ? situations.length : 0}`
+            `SITUATIONS activity details loaded: status=${detailsRes.status}, situations=${Array.isArray(situations) ? situations.length : 0}`,
           );
           if (situations && situations.length > 0) {
             situationId = situations[0].id;
@@ -589,7 +613,7 @@ export function submitActivity(candidateToken, candidateId, activity, candidateN
         situationId,
         turns: [turn],
         eventName: 'audio-line',
-        stepLabel: `${stepName} - transcript (${label})`
+        stepLabel: `${stepName} - transcript (${label})`,
       });
     } else {
       const turns = buildConversationTurns(activity.type, label, candidateName, seed);
@@ -600,7 +624,7 @@ export function submitActivity(candidateToken, candidateId, activity, candidateN
         conversationId: personaId,
         turns,
         eventName: 'text-line',
-        stepLabel: `${stepName} - transcript (${label})`
+        stepLabel: `${stepName} - transcript (${label})`,
       });
     }
     if (!transcriptResult.transcriptConfirmed) {
@@ -615,18 +639,13 @@ export function submitActivity(candidateToken, candidateId, activity, candidateN
   // ------------------------------------------------------------------
   // Step 3: Mark activity as COMPLETED (same endpoint for all types)
   // ------------------------------------------------------------------
-  const completeRes = completeCandidateActivity(
-    candidateToken,
-    activityId,
-    projectId,
-    `${stepName} - complete activity (${label})`
-  );
+  const completeRes = completeCandidateActivity(candidateToken, activityId, projectId, `${stepName} - complete activity (${label})`);
 
   return {
     status: completeRes.status,
     skipped: false,
     transcriptConfirmed: transcriptResult.transcriptConfirmed,
-    linesAcked: transcriptResult.linesAcked
+    linesAcked: transcriptResult.linesAcked,
   };
 }
 
@@ -635,26 +654,28 @@ export function submitActivity(candidateToken, candidateId, activity, candidateN
 // Activities are passed in (fetched dynamically from project details).
 // organizationId is needed for the assignedActivities endpoint.
 // All activity types are processed: CASE, WELCOME, SITUATIONS, ROLE_PLAY, INTERVIEW, BOARD_MEETING
-export function performAllActivities(email, password, candidateId, activities, organizationId, projectCandidateId = null, projectId = HARDCODED_PROJECT_ID) {
-  // Login via portal-tokens, NOT plain email/password. candidateLogin()
-  // (email+password) mints a session whose JWT `sub` does not reliably
-  // match ProjectCandidates.candidateId, so every booking/entry-check call
-  // 404s with "Candidate is not assigned to this project" even when the
-  // assignment genuinely exists (confirmed against a real portal-token HAR
-  // capture + booking-flow-api-sequence.json). portal-tokens accepts
-  // { candidateId, projectId } directly as an alternative to a
-  // portalToken from the invite email — so this works without ever
-  // touching yopmail/captcha, and yields a token whose `sub` IS the
-  // candidateId the booking service checks against.
-  const loginId = projectCandidateId || candidateId;
-  log('Flow', `Candidate login (portal-tokens): candidateId=${loginId} projectId=${projectId}`);
-  const loginResult = candidatePortalTokenLogin(loginId, projectId);
-  const candidateToken = loginResult && loginResult.token;
-  if (!candidateToken) {
-    log('Flow', `Candidate portal-token login FAILED for candidateId=${loginId} — no token returned`);
+export function performAllActivities(
+  email,
+  password,
+  candidateId,
+  activities,
+  organizationId,
+  projectCandidateId = null,
+  projectId = HARDCODED_PROJECT_ID,
+  invitationBody = '',
+) {
+  const loginResult = candidateSessionFromInviteHref(invitationBody, projectId);
+  if (!loginResult || !loginResult.token) {
+    log('Flow', `Candidate invitation href token not found for ${email}; expected access_token in the email login href.`);
     return [];
   }
-  log('Flow', `Candidate portal-token login SUCCESS for candidateId=${loginId} — resolved candidateId=${loginResult.candidateId} orgId=${loginResult.organizationId}`);
+  log('Flow', `Candidate login from invitation href: candidateId=${candidateId} projectId=${projectId}`);
+  const candidateToken = loginResult && loginResult.token;
+  if (!candidateToken) {
+    log('Flow', `Candidate invitation-token login FAILED for ${email} — no token returned`);
+    return [];
+  }
+  log('Flow', `Candidate invitation-token login SUCCESS for ${email} — orgId=${loginResult.organizationId}`);
 
   // Use organizationId from login response if available, otherwise use the one passed in
   const orgId = loginResult.organizationId || organizationId;
@@ -664,12 +685,19 @@ export function performAllActivities(email, password, candidateId, activities, o
   // their full email — derive the same thing from the email prefix.
   const candidateName = (email || 'candidate').split('@')[0];
 
-  // Accept agreement first (mirrors the candidate clicking "I Agree" in the UI)
   const actualCandidateId = loginResult.candidateId || projectCandidateId || candidateId;
   if (actualCandidateId !== candidateId) {
     log('Flow', `Using candidate profile ID ${actualCandidateId} for configured candidate ${email}`);
   }
+
+  // Accept agreement first (mirrors the candidate clicking "I Agree" in the UI)
+  if (loginResult.parentOrganizationId) {
+    getCandidatePortalTheme(candidateToken, loginResult.parentOrganizationId);
+  }
   acceptCandidateAgreement(candidateToken, actualCandidateId, projectId);
+
+  // Fetch assigned activities with the candidate invitation token.
+  activities = getAssignedActivities(candidateToken, actualCandidateId, loginResult.organizationId || organizationId, projectId);
 
   // Booking is optional for the pre-provisioned project. The candidate
   // portal may already have admitted the candidate while the booking API
@@ -704,7 +732,7 @@ export function performAllActivities(email, password, candidateId, activities, o
     results.push({
       activity: activity.title || activity.type,
       status: res.status,
-      transcriptConfirmed: res.transcriptConfirmed || false
+      transcriptConfirmed: res.transcriptConfirmed || false,
     });
     sleep(1); // mirrors a real candidate moving between tasks
   });

@@ -11,4 +11,4 @@
 // environment where "Gabriel" etc. don't exist by that exact name).
 
 export const PREFERRED_PERSONA_NAME = 'Gabriel';
-export const PREFERRED_BOARD_PERSONA_NAMES = ['Gabriel', 'Sophie Adams', 'Adams'];
+export const PREFERRED_BOARD_PERSONA_NAMES = ['Gabriel', 'Sophie Adams', 'Richard']

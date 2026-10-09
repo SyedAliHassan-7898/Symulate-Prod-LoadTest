@@ -199,8 +199,14 @@ export function createAllTaskTypes(token) {
       [`create task detail (${label}): status 2xx`]: (r) => r.status >= 200 && r.status < 300
     });
 
-    const publishRes = postJson(routes.publishActivity(activityId), {}, token, 'Publish Activity');
-    logStep(`Publish Activity (${label})`, publishRes);
+    // Publish is temporarily disabled for this environment because the
+    // deployed API does not expose POST /activities/:id/publish (404).
+    // Keep the route and code available for re-enabling after backend deploy.
+    // const publishRes = postJson(routes.publishActivity(activityId), {}, token, 'Publish Activity');
+    // logStep(`Publish Activity (${label})`, publishRes);
+    // check(publishRes, {
+    //   [`publish activity (${label}): status 2xx`]: (r) => r.status >= 200 && r.status < 300
+    // });
 
     createdActivities.push({ activityId, type, label });
   });

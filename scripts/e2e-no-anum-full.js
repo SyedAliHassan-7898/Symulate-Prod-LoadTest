@@ -15,6 +15,7 @@
 
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -206,6 +207,21 @@ function k6(script, baseEnv, extra = {}) {
     ...extra
   };
 
+  // Separate oversized values that would exceed Windows command-line limits.
+  // Write them to a temp file and pass the file path instead.
+  const MAX_ARG_LEN = 4000;
+  const tempFiles = [];
+  const oversizedKeys = Object.keys(env).filter(
+    (k) => env[k] && String(env[k]).length > MAX_ARG_LEN
+  );
+  for (const key of oversizedKeys) {
+    const tmpPath = path.join(os.tmpdir(), `k6-env-${key}-${Date.now()}.txt`);
+    fs.writeFileSync(tmpPath, String(env[key]), 'utf-8');
+    env[`${key}_FILE`] = tmpPath;
+    delete env[key];
+    tempFiles.push(tmpPath);
+  }
+
   const args = ['run'];
 
   Object.entries(env).forEach(([key, value]) => {
@@ -275,6 +291,11 @@ function k6(script, baseEnv, extra = {}) {
     console.error(
       `Unable to run k6: ${result.error.message}`
     );
+  }
+
+  // Clean up any temp files created for oversized env vars.
+  for (const tmpPath of tempFiles) {
+    try { fs.unlinkSync(tmpPath); } catch (_) {}
   }
 
   return {
@@ -687,6 +708,10 @@ async function main() {
 
     NOANUMTEST_CANDIDATE_ID:
       vars.NOANUMTEST_CANDIDATE_ID ||
+      '',
+
+    NOANUMTEST_CANDIDATE_INVITATION_HREF:
+      vars.NOANUMTEST_CANDIDATE_INVITATION_HREF ||
       ''
   };
 

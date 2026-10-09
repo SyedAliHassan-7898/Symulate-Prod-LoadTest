@@ -13,6 +13,7 @@
 
 import { check, sleep } from 'k6';
 import exec from 'k6/execution';
+import { b64decode } from 'k6/encoding';
 import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.1/index.js';
 import { htmlReport } from '../utils/local-report.js';
 
@@ -21,13 +22,19 @@ import { getJson } from '../utils/http.js';
 import { routes } from '../utils/routes.js';
 import { ANUM_API_ENABLED } from '../config/environments.js';
 
-import { superAdminLogin, impersonateClientAdmin, candidatePortalTokenLogin } from '../scenarios/login.js';
+import { superAdminLogin, impersonateClientAdmin } from '../scenarios/login.js';
 import {
   getActivitiesFromProject,
   ensureCandidateBooking,
   startCandidateActivitySessionWithRetry,
-  completeCandidateActivity
+  completeCandidateActivity,
+  candidateSessionFromInviteHref
 } from '../scenarios/candidateassessment.js';
+import {
+  getDefaultEmailTemplate,
+  sendInvitationsToProjectCandidates,
+  extractInvitationHref
+} from '../scenarios/projectcreation.js';
 
 const PROJECT_ID      = __ENV.NOANUMTEST_PROJECT_ID;
 const ADMIN_USER_ID   = __ENV.NOANUMTEST_ADMIN_USER_ID;
@@ -38,6 +45,30 @@ const ENV_AUDIT_CANDIDATE_IDS = String(__ENV.NOANUMTEST_AUDIT_CANDIDATE_IDS || '
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
+
+// Decode the base64-encoded invitation hrefs map emitted by Phase 1.
+// Shape: { "<candidateId>": "<href>", "<email>": "<href>", ... }
+// Supports both inline value and file-based delivery (for long values on Windows).
+let ENV_AUDIT_INVITATION_HREFS = {};
+try {
+  let raw = String(__ENV.NOANUMTEST_AUDIT_INVITATION_HREFS || '').trim();
+
+  // If the value was too long to pass as a CLI arg, it was written to a temp
+  // file and the path was forwarded as NOANUMTEST_AUDIT_INVITATION_HREFS_FILE.
+  if (!raw) {
+    const filePath = String(__ENV.NOANUMTEST_AUDIT_INVITATION_HREFS_FILE || '').trim();
+    if (filePath) {
+      const fileContent = open(filePath);
+      raw = String(fileContent || '').trim();
+    }
+  }
+
+  if (raw && raw !== 'FETCH_FAILED') {
+    ENV_AUDIT_INVITATION_HREFS = JSON.parse(b64decode(raw, 'std', 's'));
+  }
+} catch (e) {
+  // leave empty — will fall back to re-dispatch
+}
 
 export const options = {
   summaryTrendStats: ['count', 'avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
@@ -104,9 +135,37 @@ function responseCandidateList(res) {
   }
 }
 
-function resolveAuditCandidateIds(clientToken, requiredCount) {
+function resolveAuditCandidates(clientToken, requiredCount) {
+  // Always fetch the project candidate list so we have emails alongside IDs.
+  const res = getJson(routes.projectCandidates(PROJECT_ID), clientToken, 'Get Audit Candidate Pool');
+  logStep('Get Audit Candidate Pool', res);
+  check(res, { 'session audit: audit candidate pool fetched': (r) => r.status >= 200 && r.status < 300 });
+
+  const allCandidates = responseCandidateList(res)
+    .map((item) => {
+      const candidate = item.candidate || item.user || item.profile || item;
+      const id = parseCandidateId(item);
+      const email =
+        item.email ||
+        (candidate && candidate.email) ||
+        null;
+      return id ? { id, email } : null;
+    })
+    .filter(Boolean)
+    .filter((c) => String(c.id) !== String(BROWSER_CANDIDATE_ID));
+
+  // Remove duplicates by id.
+  const unique = [];
+  allCandidates.forEach((c) => {
+    if (!unique.some((existing) => String(existing.id) === String(c.id))) unique.push(c);
+  });
+
+  // Prefer the ENV-supplied IDs when they were provided (preserves order).
   if (ENV_AUDIT_CANDIDATE_IDS.length >= requiredCount) {
-    return ENV_AUDIT_CANDIDATE_IDS.slice(0, requiredCount);
+    return ENV_AUDIT_CANDIDATE_IDS.slice(0, requiredCount).map((envId) => {
+      const found = unique.find((c) => String(c.id) === String(envId));
+      return found || { id: envId, email: null };
+    });
   }
 
   log(
@@ -115,22 +174,55 @@ function resolveAuditCandidateIds(clientToken, requiredCount) {
       'falling back to the project candidate list'
   );
 
-  const res = getJson(routes.projectCandidates(PROJECT_ID), clientToken, 'Get Audit Candidate Pool');
-  logStep('Get Audit Candidate Pool', res);
-  check(res, { 'session audit: audit candidate pool fetched': (r) => r.status >= 200 && r.status < 300 });
-
-  const ids = responseCandidateList(res)
-    .map(parseCandidateId)
-    .filter(Boolean)
-    .filter((id) => String(id) !== String(BROWSER_CANDIDATE_ID));
-
-  // Preserve order while removing duplicates.
-  const unique = [];
-  ids.forEach((id) => {
-    if (!unique.some((existing) => String(existing) === String(id))) unique.push(id);
-  });
-
   return unique.slice(0, requiredCount);
+}
+
+// Login an audit candidate using the stored invitation href from Phase 1.
+// Falls back to a fresh invitation dispatch only if the stored href is missing.
+function auditCandidateLogin(clientToken, candidateId, candidateEmail, emailTemplateId) {
+  // 1. Try the stored href from Phase 1 bulk invitation response.
+  const storedHref =
+    ENV_AUDIT_INVITATION_HREFS[String(candidateId)] ||
+    (candidateEmail ? ENV_AUDIT_INVITATION_HREFS[String(candidateEmail).toLowerCase()] : null);
+
+  if (storedHref) {
+    const session = candidateSessionFromInviteHref(storedHref, PROJECT_ID);
+    if (session && session.token) {
+      log('Session Audit', `Candidate ${candidateId}: using stored Phase 1 invitation href.`);
+      return session;
+    }
+    log('Session Audit', `Candidate ${candidateId}: stored href present but no access_token extracted — trying re-dispatch.`);
+  } else {
+    log('Session Audit', `Candidate ${candidateId}: no stored href found — dispatching fresh invitation.`);
+  }
+
+  // 2. Fallback: re-dispatch invitation and extract href from response.
+  if (!candidateEmail) {
+    log('Session Audit', `Candidate ${candidateId}: cannot re-dispatch — email not available.`);
+    return null;
+  }
+
+  const invRes = sendInvitationsToProjectCandidates(
+    clientToken,
+    PROJECT_ID,
+    emailTemplateId,
+    [candidateId],
+    [candidateEmail]
+  );
+
+  const href = extractInvitationHref(invRes, candidateId, candidateEmail);
+  if (!href) {
+    log('Session Audit', `Candidate ${candidateId}: re-dispatch did not return accessMyPortal href for ${candidateEmail}.`);
+    return null;
+  }
+
+  const session = candidateSessionFromInviteHref(href, PROJECT_ID);
+  if (!session || !session.token) {
+    log('Session Audit', `Candidate ${candidateId}: could not extract access_token from re-dispatched href.`);
+    return null;
+  }
+
+  return session;
 }
 
 export default function () {
@@ -169,20 +261,32 @@ export default function () {
     return;
   }
 
-  const auditCandidateIds = resolveAuditCandidateIds(clientToken, activities.length);
-  const candidatePoolReady = check(auditCandidateIds, {
-    'session audit: one dedicated audit candidate per activity': (ids) =>
-      Array.isArray(ids) && ids.length >= activities.length
+  const auditCandidates = resolveAuditCandidates(clientToken, activities.length);
+  const candidatePoolReady = check(auditCandidates, {
+    'session audit: one dedicated audit candidate per activity': (candidates) =>
+      Array.isArray(candidates) && candidates.length >= activities.length
   });
 
   if (!candidatePoolReady) {
     log(
       'Session Audit',
-      `ABORTED — need ${activities.length} dedicated audit candidates but only resolved ${auditCandidateIds.length}. ` +
+      `ABORTED — need ${activities.length} dedicated audit candidates but only resolved ${auditCandidates.length}. ` +
         'Phase 1 should print NOANUMTEST_AUDIT_CANDIDATE_IDS using john2..john7.'
     );
     exec.test.abort('insufficient dedicated audit candidates');
     return;
+  }
+
+  // Fetch email template once for all audit invitation dispatches.
+  let auditEmailTemplateId = null;
+  try {
+    const projectRes = getJson(routes.projectById(PROJECT_ID), clientToken, 'Get Project Details (Audit Email Template)');
+    logStep('Get Project Details (Audit Email Template)', projectRes);
+    const projectBody = projectRes.json ? projectRes.json() : {};
+    const projectData = (projectBody && projectBody.data) || projectBody;
+    auditEmailTemplateId = getDefaultEmailTemplate(clientToken, projectData && projectData.emailTemplateId);
+  } catch (e) {
+    log('Session Audit', `Could not fetch email template for audit invitations: ${e}`);
   }
 
   let leaks = 0;
@@ -192,14 +296,17 @@ export default function () {
 
   activities.forEach((activity, index) => {
     const label = activity.title || activity.type || activity.id;
-    const candidateId = auditCandidateIds[index];
+    const auditCandidate = auditCandidates[index];
+    const candidateId = auditCandidate && auditCandidate.id;
+    const candidateEmail = auditCandidate && auditCandidate.email;
 
     log(
       'Session Audit',
       `Activity ${index + 1}/${activities.length}: "${label}" -> dedicated audit candidate ${candidateId}`
     );
 
-    const candidateSession = candidatePortalTokenLogin(candidateId, PROJECT_ID);
+    // Use invitation-href login — portal-tokens is deprecated/unavailable.
+    const candidateSession = auditCandidateLogin(clientToken, candidateId, candidateEmail, auditEmailTemplateId);
     const loginOk = !!(candidateSession && candidateSession.token);
     check(loginOk, {
       [`session audit (${label}): dedicated candidate portal login succeeded`]: (ok) => ok === true

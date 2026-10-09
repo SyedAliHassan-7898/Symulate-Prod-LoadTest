@@ -24,7 +24,10 @@ export const routes = {
   // --- Auth -----------------------------------------------------------
   login: () => `${API_URL}/auth/login`, // CONFIRMED: Super Admin + Client Admin, body { email, password }
   candidateLogin: () => `${API_URL}/auth/candidate/login`, // CONFIRMED: same LoginDto (email/password) — NOT an access-token endpoint
-  candidatePortalTokens: () => `${API_URL}/auth/candidate/portal-tokens`, // CONFIRMED (booking-flow-api-sequence.json + real HAR capture): the REAL candidate session type — accepts either { portalToken } from the invite link, or { candidateId, projectId } directly. sub === candidateId in the resulting JWT, unlike candidateLogin above. Booking/entry-check ONLY work against a session minted here.
+  // Deprecated for this smoke flow: candidate sessions now come from the
+  // invitation email href. Kept for legacy standalone scenarios only.
+  candidatePortalTokens: () => `${API_URL}/auth/candidate/portal-tokens`,
+  candidatePortalTheme: (parentOrganizationId) => `${API_URL}/branding/get-theme/candidate/${parentOrganizationId}`,
   impersonateUser: () => `${API_URL}/auth/impersonate-user`, // CONFIRMED path/body { userId }; used to get a Client Admin session without a real password
   verifyImpersonateUser: () => `${API_URL}/auth/verify-impersonate-user`, // CONFIRMED path, body { token } — redeems the impersonation token from above
 

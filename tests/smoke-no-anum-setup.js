@@ -12,6 +12,7 @@
 
 import { check, sleep } from 'k6';
 import exec from 'k6/execution';
+import { b64encode } from 'k6/encoding';
 import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.1/index.js';
 import { htmlReport } from '../utils/local-report.js';
 
@@ -27,8 +28,12 @@ import { setupAccountAndSkillsProfile } from '../scenarios/accountsetup.js';
 import {
   completeProjectCreationFlow,
   configureTalentIntelligenceForMode,
-  normalizeAnamMode
+  normalizeAnamMode,
+  getDefaultEmailTemplate,
+  sendInvitationsToProjectCandidates,
+  extractInvitationHref
 } from '../scenarios/projectcreation.js';
+import { candidateSessionFromInviteHref } from '../scenarios/candidateassessment.js';
 
 const ANAM_MODE = normalizeAnamMode(__ENV.ANAM_MODE);
 
@@ -179,6 +184,7 @@ export default function () {
     let candidateParentOrgId = null;
 
     if (browserCandidateId && projectId) {
+      // Try portal-tokens first; fall back to invitation-href if the endpoint returns 404.
       try {
         const portalSession = candidatePortalTokenLogin(browserCandidateId, projectId);
         candidateAccessToken = portalSession && portalSession.token ? portalSession.token : null;
@@ -188,7 +194,45 @@ export default function () {
           ? portalSession.parentOrganizationId
           : null;
       } catch (e) {
-        log('Anam Setup', `Browser candidate portal-token login failed: ${e}`);
+        log('Anam Setup', `Browser candidate portal-token login threw: ${e}.`);
+      }
+
+      // Fallback: re-dispatch invitation for browser candidate and extract token from href.
+      if (!candidateAccessToken) {
+        log(
+          'Anam Setup',
+          'portal-tokens unavailable — falling back to invitation-href login for browser candidate.'
+        );
+        try {
+          const invHref = project.invitationHref || project.invitationBody || '';
+          let session = invHref ? candidateSessionFromInviteHref(invHref, projectId) : null;
+
+          // If the stored href didn't contain a token, dispatch a fresh invitation.
+          if (!session || !session.token) {
+            const emailTemplateId = getDefaultEmailTemplate(clientToken, project.emailTemplateId);
+            const freshInvRes = sendInvitationsToProjectCandidates(
+              clientToken,
+              projectId,
+              emailTemplateId,
+              [browserCandidateId],
+              [browserCandidateEmail]
+            );
+            const freshHref = extractInvitationHref(freshInvRes, browserCandidateId, browserCandidateEmail);
+            session = freshHref ? candidateSessionFromInviteHref(freshHref, projectId) : null;
+          }
+
+          if (session && session.token) {
+            candidateAccessToken = session.token;
+            candidateRefreshToken = session.refreshToken || null;
+            candidateOrgId = session.organizationId || null;
+            candidateParentOrgId = session.parentOrganizationId || null;
+            log('Anam Setup', 'Browser candidate session obtained from invitation href.');
+          } else {
+            log('Anam Setup', 'WARNING: invitation href fallback also failed to produce a token. Phase 3 browser validation will not be able to authenticate.');
+          }
+        } catch (e) {
+          log('Anam Setup', `Invitation href fallback failed: ${e}`);
+        }
       }
     }
 
@@ -201,6 +245,25 @@ export default function () {
     log('Anam Setup', `   NOANUMTEST_CANDIDATE_ID=${browserCandidateId || 'FETCH_FAILED'}`);
     log('Anam Setup', `   NOANUMTEST_CANDIDATE_EMAIL=${browserCandidateEmail || 'FETCH_FAILED'}`);
     log('Anam Setup', `   NOANUMTEST_AUDIT_CANDIDATE_IDS=${auditCandidateIds.join(',')}`);
+
+    // Emit the browser candidate's direct invitation href so Phase 3 can
+    // navigate the SPA without needing a mock portal-tokens intercept.
+    const browserCandidateHref =
+      (project.allInvitationHrefs && (
+        (browserCandidateId && project.allInvitationHrefs[String(browserCandidateId)]) ||
+        (browserCandidateEmail && project.allInvitationHrefs[String(browserCandidateEmail).toLowerCase()])
+      )) ||
+      project.invitationHref ||
+      '';
+    log('Anam Setup', `   NOANUMTEST_CANDIDATE_INVITATION_HREF=${browserCandidateHref || 'FETCH_FAILED'}`);
+
+    // Emit per-candidate invitation hrefs for audit phase (base64-encoded JSON to survive log parsing).
+    // Format: { "<candidateId>": "<href>", "<email>": "<href>", ... }
+    // Format: { "<candidateId>": "<href>", "<email>": "<href>", ... }
+    const auditHrefsMap = project.allInvitationHrefs || {};
+    const auditHrefsJson = JSON.stringify(auditHrefsMap);
+    const auditHrefsB64 = b64encode(auditHrefsJson);
+    log('Anam Setup', `   NOANUMTEST_AUDIT_INVITATION_HREFS=${auditHrefsB64}`);
     log('Anam Setup', '');
     const emitSessionSecrets = String(__ENV.E2E_EMIT_SESSION_SECRETS || 'false').toLowerCase() === 'true';
     log(
