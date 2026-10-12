@@ -68,7 +68,7 @@ CLIENT_ADMIN_URL=https://client-admin.symulate-dev.weuno.co
 CANDIDATE_URL=https://symulate-ai-dev.weuno.co
 
 SUPER_ADMIN_EMAIL=superadmin@yopmail.com
-SUPER_ADMIN_PASSWORD=Test@123
+SUPER_ADMIN_PASSWORD=
 
 # Test behavior
 LOAD_MODE=smoke                    # smoke = 1 VU | load = LOAD_VUS VUs
