@@ -27,7 +27,7 @@
     "load:candidate:situation": "node scripts/run.js tests/load-candidate-assessment.js LOAD_MODE=load SCENARIO=situation-only LOAD_VUS=1",
     "review": "node scripts/run.js tests/load-project-review.js LOAD_MODE=smoke SCENARIO=full LOAD_VUS=1",
     "review:grafana": "node scripts/run.js tests/load-project-review.js LOAD_MODE=smoke SCENARIO=full LOAD_VUS=1 K6_INFLUXDB_PUSH_INTERVAL=3s --out influxdb=http://localhost:8087/k6",
-    "load:review": "node scripts/run.js tests/load-project-review.js LOAD_MODE=load SCENARIO=full LOAD_VUS=1",
+    "load:review": "node scripts/run.js tests/load-project-review.js LOAD_MODE=load SCENARIO=full LOAD_ITERATIONS_PER_VU=1",
     "report:csv": "node scripts/generate-csv-report.js",
     "monitoring:up": "docker compose -f monitoring/docker-compose.yml up -d",
     "monitoring:down": "docker compose -f monitoring/docker-compose.yml down",

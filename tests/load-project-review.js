@@ -20,8 +20,8 @@ import {
 import { reportName, log } from '../utils/helpers.js';
 import { projectReviewLogin, runProjectReviewFlow } from '../scenarios/projectreview.js';
 
-const LOAD_VUS = Math.max(1, Number(__ENV.LOAD_VUS || 1));
-const ITERATIONS_PER_VU = Math.max(1, Number(__ENV.LOAD_ITERATIONS_PER_VU || 1));
+const LOAD_VUS = Math.max(1, Number(__ENV.LOAD_VUS || __ENV.LOAD_VUS));
+const ITERATIONS_PER_VU = Math.max(1, Number(__ENV.LOAD_ITERATIONS_PER_VU || __ENV.LOAD_ITERATIONS_PER_VU ));
 
 export const options = {
   summaryTrendStats: ['count', 'avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
