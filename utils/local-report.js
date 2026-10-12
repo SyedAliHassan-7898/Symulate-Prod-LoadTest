@@ -49,7 +49,7 @@ export function htmlReport(data) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>k6 Load Test Report</title>
+  <title>Symulate-AI k6 Load Test Report</title>
   <style>
     :root { color-scheme: light; font-family: system-ui, sans-serif; }
     body { margin: 2rem auto; max-width: 1200px; padding: 0 1rem; color: #1f2937; }
@@ -64,7 +64,7 @@ export function htmlReport(data) {
   </style>
 </head>
 <body>
-  <h1>k6 Load Test Report</h1>
+  <h1>Symulate-AI k6 Load Test Report</h1>
   <p>Generated ${escapeHtml(new Date().toISOString())}</p>
   <div class="summary">
     <div class="stat">Requests<strong>${formatNumber(metricValue(metrics.http_reqs, 'count'))}</strong></div>
