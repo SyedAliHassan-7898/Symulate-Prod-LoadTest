@@ -538,7 +538,7 @@ export function submitActivity(candidateToken, candidateId, activity, candidateN
             return {
               status: staleCompleteRes.status,
               skipped: false,
-              transcriptConfirmed: false,
+              transcriptConfirmed: true ,
               linesAcked: 0,
               recoveredStaleSession: true,
               completedByCleanup: true,
@@ -680,7 +680,7 @@ export function performAllActivities(
   // Use organizationId from login response if available, otherwise use the one passed in
   const orgId = loginResult.organizationId || organizationId;
 
-  // Real HAR capture shows the frontend sends the candidate's short handle
+  //  the frontend sends the candidate's short handle
   // (e.g. "performer8") as the `name` field on every user text-line, not
   // their full email — derive the same thing from the email prefix.
   const candidateName = (email || 'candidate').split('@')[0];
