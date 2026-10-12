@@ -137,7 +137,8 @@ export default function () {
     const setup = setupAccountAndSkillsProfile(clientToken, orgId);
     const projectOrgId = setup.accountOrgId || orgId;
     const minimumCandidates = activities.length + 1;
-    if (NUM_CANDIDATES < minimumCandidates) {
+    const isSharedLoadMode = String(__ENV.CANDIDATE_EXECUTION_SOURCE || '').trim() === 'none';
+    if (!isSharedLoadMode && NUM_CANDIDATES < minimumCandidates) {
       exec.test.abort(
         `Anam validation requires at least ${minimumCandidates} project candidates ` +
         `(1 browser candidate + ${activities.length} dedicated audit candidates); NUM_CANDIDATES=${NUM_CANDIDATES}.`
@@ -173,10 +174,14 @@ export default function () {
     check(browserCandidateId, {
       'anam setup: browser candidate id available': (id) => !!id
     });
-    check(auditCandidateIds, {
-      'anam setup: dedicated audit candidate ids available': (ids) =>
-        ids.length === requiredAuditCandidates
-    });
+    // In shared-load mode (CANDIDATE_EXECUTION_SOURCE=none) audit candidates are not
+    // needed — all provisioned candidates are load-test VU candidates, not audit slots.
+    if (!isSharedLoadMode) {
+      check(auditCandidateIds, {
+        'anam setup: dedicated audit candidate ids available': (ids) =>
+          ids.length === requiredAuditCandidates
+      });
+    }
 
     let candidateAccessToken = null;
     let candidateRefreshToken = null;

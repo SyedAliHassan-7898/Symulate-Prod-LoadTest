@@ -36,13 +36,19 @@ function headers(token, extra = {}) {
 
 // Executes an HTTP call and retries on 429 (rate limit) with exponential backoff.
 // Returns the final response (which may still be 429 if all retries exhausted).
-function requestWithRetry(fn, name) {
+function requestWithRetry(fn, name, url) {
   let res = fn();
+  if (res && res.status === 429) {
+    console.log(`[429 RATE LIMIT] flow="${name}" url="${url}" — Too Many Requests from this IP`);
+  }
   for (let attempt = 1; attempt <= MAX_RETRIES && res && res.status === 429; attempt++) {
     const waitSec = BASE_BACKOFF_SEC * attempt; // 2s, 4s, 6s
-    console.log(`[RETRY] ${name} — 429 rate limited, retry ${attempt}/${MAX_RETRIES} after ${waitSec}s`);
+    console.log(`[RETRY] ${name} — 429 rate limited on ${url}, retry ${attempt}/${MAX_RETRIES} after ${waitSec}s`);
     sleep(waitSec);
     res = fn();
+    if (res && res.status === 429 && attempt === MAX_RETRIES) {
+      console.log(`[429 EXHAUSTED] flow="${name}" url="${url}" — all ${MAX_RETRIES} retries failed, still rate limited`);
+    }
   }
   return res;
 }
@@ -50,7 +56,7 @@ function requestWithRetry(fn, name) {
 export function getJson(url, token, name) {
   const res = requestWithRetry(
     () => http.get(url, { headers: headers(token), tags: { name } }),
-    name
+    name, url
   );
   recordBytes(res, name);
   return res;
@@ -59,7 +65,7 @@ export function getJson(url, token, name) {
 export function getJsonWithHeaders(url, token, name, extraHeaders = {}) {
   const res = requestWithRetry(
     () => http.get(url, { headers: headers(token, extraHeaders), tags: { name } }),
-    name
+    name, url
   );
   recordBytes(res, name);
   return res;
@@ -68,7 +74,7 @@ export function getJsonWithHeaders(url, token, name, extraHeaders = {}) {
 export function postJson(url, body, token, name) {
   const res = requestWithRetry(
     () => http.post(url, JSON.stringify(body), { headers: headers(token), tags: { name } }),
-    name
+    name, url
   );
   recordBytes(res, name);
   return res;
@@ -77,7 +83,7 @@ export function postJson(url, body, token, name) {
 export function postJsonWithHeaders(url, body, token, name, extraHeaders = {}) {
   const res = requestWithRetry(
     () => http.post(url, JSON.stringify(body), { headers: headers(token, extraHeaders), tags: { name } }),
-    name
+    name, url
   );
   recordBytes(res, name);
   return res;
@@ -86,7 +92,7 @@ export function postJsonWithHeaders(url, body, token, name, extraHeaders = {}) {
 export function patchJson(url, body, token, name) {
   const res = requestWithRetry(
     () => http.patch(url, JSON.stringify(body), { headers: headers(token), tags: { name } }),
-    name
+    name, url
   );
   recordBytes(res, name);
   return res;
@@ -95,7 +101,7 @@ export function patchJson(url, body, token, name) {
 export function patchJsonWithHeaders(url, body, token, name, extraHeaders = {}) {
   const res = requestWithRetry(
     () => http.patch(url, JSON.stringify(body), { headers: headers(token, extraHeaders), tags: { name } }),
-    name
+    name, url
   );
   recordBytes(res, name);
   return res;
@@ -104,7 +110,7 @@ export function patchJsonWithHeaders(url, body, token, name, extraHeaders = {}) 
 export function postMultipart(url, fields, token, name) {
   const res = requestWithRetry(
     () => http.post(url, fields, { headers: headers(token, { 'Content-Type': undefined }), tags: { name } }),
-    name
+    name, url
   );
   recordBytes(res, name);
   return res;

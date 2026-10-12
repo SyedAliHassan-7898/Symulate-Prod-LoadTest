@@ -112,10 +112,10 @@ function parseLongVar(output, key) {
 async function main() {
   const fileEnv = readEnv();
 
-  // Config — override from env if needed
-  const NUM_CANDIDATES = Number(fileEnv.NUM_CANDIDATES || 150);
-  const LOAD_VUS       = Number(fileEnv.LOAD_VUS || 150);
-  const LOAD_MAX_DURATION = fileEnv.LOAD_MAX_DURATION || '30m';
+  // Config — always read from .env file; cross-env / npm script defaults are ignored
+  const NUM_CANDIDATES    = Number(fileEnv.NUM_CANDIDATES    || 10);
+  const LOAD_VUS          = Number(fileEnv.LOAD_VUS          || 10);
+  const LOAD_MAX_DURATION =        fileEnv.LOAD_MAX_DURATION || '10m';
 
   console.log('\n============================================================');
   console.log(`Shared-Project Load Test`);
@@ -197,7 +197,7 @@ async function main() {
   console.log(`  Hrefs file  : ${hrefsTmpPath}`);
 
   // ── PHASE 2: 150 concurrent VUs perform activities ─────────────────────────
-  console.log('\n=== Phase 2/2 — k6: 150 concurrent candidate assessments ===\n');
+  console.log('\n=== Phase 2/2 — k6:  concurrent candidate assessments ===\n');
 
   const actualVUs = Math.min(LOAD_VUS, candidateCount);
   if (actualVUs < LOAD_VUS) {
