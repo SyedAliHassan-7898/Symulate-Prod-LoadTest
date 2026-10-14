@@ -121,6 +121,7 @@ export const routes = {
   // --- Candidate activity / response submission ---------------------------
   stimuliByActivity: (activityId) => `${API_URL}/stimuli/activity/${activityId}`, // CONFIRMED — resolves stimulusId needed by POST /responses
   startSession: () => `${API_URL}/activities/session-token`, // CONFIRMED from HAR: POST with { projectId, activityId }
+  welcomeSessionToken: (activityId) => `${API_URL}/welcome-activities/session-token/${activityId}`,
   startBoardMeetingSession: (activityId, personaId, projectId) => `${API_URL}/activities/${activityId}/board-meeting/${personaId}/session-token?projectId=${projectId}`, // CONFIRMED from HAR
   startContactSession: (contactId, projectId) => `${API_URL}/activities/contacts/${contactId}/session-token?projectId=${projectId}`, // CONFIRMED from HAR
   completeSession: (id) => `${API_URL}/sessions/${id}/complete`, // LEGACY/DO NOT USE in current dev: runtime returned 404. Use updateActivityStatus(activityId) -> COMPLETED for session/activity cleanup.

@@ -15,7 +15,7 @@
 // that's not how it actually works. The real flow per activity is:
 //   1. POST session-token (or the board-meeting/contact variants)  -> sessionId
 //   2. Client opens a Socket.IO connection, joins a room keyed by
-//      activityId, and streams "text-line" events (role: persona/user) as
+//      sessionId, and streams "text-line" events (role: persona/user) as
 //      the Anam voice conversation happens. Server persists these into a
 //      transcript row and echoes "transcript-updated"/"transcribed-line".
 //      SITUATIONS sends a single "audio-line" event instead (no persona
@@ -60,7 +60,7 @@ export function getAssignedActivities(candidateToken, candidateId, organizationI
     // Response structure: { data: { stages: [{ stageActivities: [{ activity: {...}, activityId, ... }] }] } }
     const activities = [];
     const stages = project.stages || [];
-    stages.forEach((stage) => {
+    stages.forEach((stage, stageOrder) => {
       const stageActivities = stage.stageActivities || [];
       stageActivities.forEach((sa) => {
         const activity = sa.activity || {};
@@ -69,11 +69,13 @@ export function getAssignedActivities(candidateToken, candidateId, organizationI
           title: activity.title || activity.type,
           type: activity.type || sa.type,
           stageId: stage.id,
+          stageOrder,
+          sequence: Number.isFinite(Number(sa.sequence)) ? Number(sa.sequence) : activities.length,
           candidateId,
         });
       });
     });
-    return activities;
+    return activities.sort((a, b) => a.stageOrder - b.stageOrder || a.sequence - b.sequence);
   } catch (e) {
     return [];
   }
@@ -93,7 +95,7 @@ export function getActivitiesFromProject(adminToken, candidateId, projectId = HA
     // Response structure: { data: { stages: [{ stageActivities: [{ activity: {...}, activityId, ... }] }] } }
     const activities = [];
     const stages = project.stages || [];
-    stages.forEach((stage) => {
+    stages.forEach((stage, stageOrder) => {
       const stageActivities = stage.stageActivities || [];
       stageActivities.forEach((sa) => {
         const activity = sa.activity || {};
@@ -102,11 +104,13 @@ export function getActivitiesFromProject(adminToken, candidateId, projectId = HA
           title: activity.title || activity.type,
           type: activity.type || sa.type,
           stageId: stage.id,
+          stageOrder,
+          sequence: Number.isFinite(Number(sa.sequence)) ? Number(sa.sequence) : activities.length,
           candidateId,
         });
       });
     });
-    return activities;
+    return activities.sort((a, b) => a.stageOrder - b.stageOrder || a.sequence - b.sequence);
   } catch (e) {
     return [];
   }
@@ -479,6 +483,33 @@ export function completeCandidateActivity(candidateToken, activityOrId, projectI
   return res;
 }
 
+function verifyWelcomeSessionToken(candidateToken, activity) {
+  const label = activity.title || 'Welcome activity';
+  const response = getJson(
+    routes.welcomeSessionToken(activity.id),
+    candidateToken,
+    `Get Welcome Session Token (${label})`,
+  );
+  logStep(`Get Welcome Session Token (${label})`, response);
+
+  let hasSessionToken = false;
+  if (response.status >= 200 && response.status < 300) {
+    try {
+      const body = response.json();
+      hasSessionToken = Boolean(body && body.data && body.data.sessionToken);
+    } catch (_) {
+      hasSessionToken = false;
+    }
+  }
+
+  check(response, {
+    [`welcome session token (${label}): status 2xx`]: (r) => r.status >= 200 && r.status < 300,
+    [`welcome session token (${label}): token returned`]: () => hasSessionToken,
+  });
+
+  return { status: response.status, skipped: false, transcriptConfirmed: false, linesAcked: 0 };
+}
+
 export function submitActivity(candidateToken, candidateId, activity, candidateName = 'Candidate', projectId = HARDCODED_PROJECT_ID) {
   const activityId = activity.id;
   const label = activity.title || activity.type || 'Unknown';
@@ -711,11 +742,29 @@ export function performAllActivities(
     log('Flow', 'Booking gate disabled; continuing with the existing activity session flow');
   }
 
-  log('Flow', `Processing all ${activities.length} activities`);
-
+  const welcomeActivities = activities.filter((activity) => activity.type === 'WELCOME');
+  const stageActivities = activities.filter((activity) => activity.type !== 'WELCOME');
   const results = [];
 
-  activities.forEach((activity, activityIndex) => {
+  if (ANUM_API_ENABLED) {
+    for (const activity of welcomeActivities) {
+      log('Flow', `Checking Welcome activity through its dedicated token route: ${activity.title}`);
+      results.push({
+        activity: activity.title || activity.type,
+        ...verifyWelcomeSessionToken(candidateToken, activity),
+      });
+    }
+  } else if (welcomeActivities.length > 0) {
+    log(
+      'Flow',
+      `Skipping ${welcomeActivities.length} Welcome token request(s): ANUM_API_ENABLED=false; ` +
+        'Welcome token generation requires the Anam service.',
+    );
+  }
+
+  log('Flow', `Processing ${stageActivities.length} ordered stage activities`);
+
+  for (const [activityIndex, activity] of stageActivities.entries()) {
     log('Flow', `Starting activity: ${activity.title} (${activity.type})`);
 
     // First activity gets an extra warm-up pause so Anam's WebSocket
@@ -734,8 +783,18 @@ export function performAllActivities(
       status: res.status,
       transcriptConfirmed: res.transcriptConfirmed || false,
     });
+
+    if (res.skipped || res.status < 200 || res.status >= 300) {
+      log(
+        'Flow',
+        `Stopping this candidate flow after ${activity.title || activity.type} failed to start or complete; ` +
+          'later activities are not eligible until the current activity is completed.',
+      );
+      break;
+    }
+
     sleep(1); // mirrors a real candidate moving between tasks
-  });
+  }
 
   return results;
 }
