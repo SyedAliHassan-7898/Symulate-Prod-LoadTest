@@ -2,7 +2,7 @@
 //
 // WHY THIS FILE EXISTS
 // --------------------
-// Captured HAR (symulate-ai-dev_weuno_co.har) shows the real transcript is
+//   shows the real transcript is
 // NOT built from a plain REST call. It's built turn-by-turn over the
 // Socket.IO channel (wss://.../dev/api/socket.io/...):
 //   client emits  42["text-line", { activityId, sessionId, id, role,
