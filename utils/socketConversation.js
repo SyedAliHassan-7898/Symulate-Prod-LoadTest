@@ -3,7 +3,7 @@
 // Drives the real transcript-persistence channel confirmed in
 // symulate-ai-dev_weuno_co.har: the frontend does NOT submit a transcript
 // via a plain REST call. It opens a Socket.IO connection, joins a room
-// keyed by activityId, and streams one "text-line" event per utterance —
+// keyed by sessionId, and streams one "text-line" event per utterance —
 //   { activityId, sessionId, id, role, content, interrupted, name }
 // (SITUATIONS sends a single "audio-line" event with the same shape,
 // candidate side only). The server echoes back "transcript-updated" (the
@@ -349,7 +349,7 @@ function _attemptTranscriptConversation({
         }
         // Socket.IO connect ack -> join the room.
         if (data.startsWith('40{') || data === '40') {
-          socket.send(`42${JSON.stringify(['join-room', activityId])}`);
+          socket.send(`42${JSON.stringify(['join-room', sessionId])}`);
           return;
         }
         // Regular event frame.
