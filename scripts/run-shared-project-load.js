@@ -267,7 +267,7 @@ async function main() {
     ANAM_MODE:                fileEnv.ANAM_MODE || 'disabled'
   };
 
-  const phase2 = k6('tests/shared-project-admin-candidate-load.js', phase2Env, grafanaArgs);
+  const phase2 = k6('tests/shared-project-admin-candidate-load.js', phase2Env);
 
   // Cleanup temp file
   try { fs.unlinkSync(hrefsTmpPath); } catch (_) {}

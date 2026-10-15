@@ -67,8 +67,7 @@
     "load:no-anum:grafana": "node scripts/run.js tests/smoke.js LOAD_MODE=load ANUM_API_ENABLED=false K6_INFLUXDB_PUSH_INTERVAL=3s --out influxdb=http://localhost:8087/k6",
     "load:shared": "node scripts/run-shared-project-load.js",
     "load:shared:admin": "node scripts/run-shared-project-load.js",
-    "load:shared:grafana": "node scripts/run-shared-project-load.js --grafana",
-    "admin:shared:grafana": "node scripts/run-shared-project-load.js --grafana"
+    "load:shared:grafana": "node scripts/run-shared-project-load.js K6_INFLUXDB_PUSH_INTERVAL=3s --out influxdb=http://localhost:8087/k6"
   },
   "devDependencies": {
     "cross-env": "^10.0.0",
