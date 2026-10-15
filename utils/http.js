@@ -14,7 +14,7 @@ export const sentBytes = new Counter('sent_bytes');
 
 // Retry configuration for 429 (Too Many Requests) responses.
 // Retries up to MAX_RETRIES times with exponential backoff.
-const MAX_RETRIES = 3;
+const MAX_RETRIES = Math.max(0, Number(__ENV.HTTP_429_MAX_RETRIES ?? 3));
 const BASE_BACKOFF_SEC = 2;
 
 function recordBytes(res, name) {

@@ -21,7 +21,7 @@ import { reportName, log, logStep, uniqueSuffix } from '../utils/helpers.js';
 import { getJson, postJson, extractId } from '../utils/http.js';
 import { routes } from '../utils/routes.js';
 
-import { superAdminLogin, impersonateClientAdmin, candidatePortalTokenLogin } from '../scenarios/login.js';
+import { superAdminLogin, impersonateClientAdmin } from '../scenarios/login.js';
 import { createAllTaskTypes } from '../scenarios/taskcreation.js';
 import { assignTasksToOrg } from '../scenarios/taskassign.js';
 import { setupAccountAndSkillsProfile } from '../scenarios/accountsetup.js';
@@ -189,55 +189,55 @@ export default function () {
     let candidateParentOrgId = null;
 
     if (browserCandidateId && projectId) {
-      // Try portal-tokens first; fall back to invitation-href if the endpoint returns 404.
+      // Candidate portal-tokens is not part of the current backend contract.
+      // The supported local/dev load-test login is the access token returned
+      // with the invitation link by the invitation endpoint.
       try {
-        const portalSession = candidatePortalTokenLogin(browserCandidateId, projectId);
-        candidateAccessToken = portalSession && portalSession.token ? portalSession.token : null;
-        candidateRefreshToken = portalSession && portalSession.refreshToken ? portalSession.refreshToken : null;
-        candidateOrgId = portalSession && portalSession.organizationId ? portalSession.organizationId : null;
-        candidateParentOrgId = portalSession && portalSession.parentOrganizationId
-          ? portalSession.parentOrganizationId
-          : null;
-      } catch (e) {
-        log('Anam Setup', `Browser candidate portal-token login threw: ${e}.`);
-      }
+        const invHref =
+          (project.allInvitationHrefs && (
+            project.allInvitationHrefs[String(browserCandidateId)] ||
+            (browserCandidateEmail && project.allInvitationHrefs[String(browserCandidateEmail).toLowerCase()])
+          )) || project.invitationHref || '';
+        const session = invHref ? candidateSessionFromInviteHref(invHref, projectId) : null;
 
-      // Fallback: re-dispatch invitation for browser candidate and extract token from href.
-      if (!candidateAccessToken) {
-        log(
-          'Anam Setup',
-          'portal-tokens unavailable — falling back to invitation-href login for browser candidate.'
-        );
-        try {
-          const invHref = project.invitationHref || project.invitationBody || '';
-          let session = invHref ? candidateSessionFromInviteHref(invHref, projectId) : null;
-
-          // If the stored href didn't contain a token, dispatch a fresh invitation.
-          if (!session || !session.token) {
-            const emailTemplateId = getDefaultEmailTemplate(clientToken, project.emailTemplateId);
-            const freshInvRes = sendInvitationsToProjectCandidates(
-              clientToken,
-              projectId,
-              emailTemplateId,
-              [browserCandidateId],
-              [browserCandidateEmail]
-            );
-            const freshHref = extractInvitationHref(freshInvRes, browserCandidateId, browserCandidateEmail);
-            session = freshHref ? candidateSessionFromInviteHref(freshHref, projectId) : null;
-          }
-
-          if (session && session.token) {
-            candidateAccessToken = session.token;
-            candidateRefreshToken = session.refreshToken || null;
-            candidateOrgId = session.organizationId || null;
-            candidateParentOrgId = session.parentOrganizationId || null;
-            log('Anam Setup', 'Browser candidate session obtained from invitation href.');
+        if (session && session.token) {
+          candidateAccessToken = session.token;
+          candidateRefreshToken = session.refreshToken || null;
+          candidateOrgId = session.organizationId || null;
+          candidateParentOrgId = session.parentOrganizationId || null;
+          log('Anam Setup', 'Browser candidate session obtained from invitation href.');
+        } else if (isSharedLoadMode) {
+          const message =
+            'Invitation API did not return candidate portal links. For local load testing set ' +
+            'EXPOSE_CANDIDATE_PORTAL_LINKS=true in the backend environment loaded by the process, restart it, ' +
+            'and rerun setup. No extra invitation was sent.';
+          log('Anam Setup', `ERROR: ${message}`);
+          exec.test.abort(message);
+          return;
+        } else {
+          // Non-shared E2E mode may re-dispatch once to obtain a fresh browser link.
+          const emailTemplateId = getDefaultEmailTemplate(clientToken, project.emailTemplateId);
+          const freshInvRes = sendInvitationsToProjectCandidates(
+            clientToken,
+            projectId,
+            emailTemplateId,
+            [browserCandidateId],
+            [browserCandidateEmail],
+          );
+          const freshHref = extractInvitationHref(freshInvRes, browserCandidateId, browserCandidateEmail);
+          const freshSession = freshHref ? candidateSessionFromInviteHref(freshHref, projectId) : null;
+          if (freshSession && freshSession.token) {
+            candidateAccessToken = freshSession.token;
+            candidateRefreshToken = freshSession.refreshToken || null;
+            candidateOrgId = freshSession.organizationId || null;
+            candidateParentOrgId = freshSession.parentOrganizationId || null;
+            log('Anam Setup', 'Browser candidate session obtained from refreshed invitation href.');
           } else {
-            log('Anam Setup', 'WARNING: invitation href fallback also failed to produce a token. Phase 3 browser validation will not be able to authenticate.');
+            log('Anam Setup', 'WARNING: invitation response contained no candidate portal token.');
           }
-        } catch (e) {
-          log('Anam Setup', `Invitation href fallback failed: ${e}`);
         }
+      } catch (e) {
+        log('Anam Setup', `Invitation-href candidate login failed: ${e}`);
       }
     }
      

@@ -1,6 +1,145 @@
 # Symulate AI Load Testing & Monitoring Suite
 
-k6 + Playwright based load testing suite for Symulate AI platform. Covers smoke testing, concurrent shared-project load testing, Anam AI outage validation, and optional Grafana/InfluxDB live monitoring.
+**Production-grade k6 + Playwright load testing framework** for Symulate AI platform with real-time Grafana monitoring.
+
+## 🎯 What This Project Does
+
+This is a complete load testing infrastructure that simulates real users interacting with the Symulate AI assessment platform. It covers:
+
+- ✅ **Smoke Testing** - Quick validation that everything works
+- ✅ **Concurrent Load Testing** - Simulate 1-150+ users simultaneously on shared projects
+- ✅ **Isolated Load Testing** - Test multiple independent projects
+- ✅ **Anam AI Resilience** - Validate system behavior during AI service outages
+- ✅ **Real-time Monitoring** - Live Grafana dashboards with InfluxDB metrics
+- ✅ **Admin + Candidate Flow** - Full end-to-end lifecycle testing
+
+---
+
+## 📊 Project Architecture
+
+```
+symulate-load-tests/
+├── 📁 tests/              # k6 test scripts (the actual load tests)
+│   ├── smoke.js                        # Single-user validation
+│   ├── smoke-no-anum-setup.js          # Project provisioning (Phase 1)
+│   ├── smoke-no-anum-perform.js        # Activity execution (Phase 2)
+│   ├── shared-project-admin-candidate-load.js  # Concurrent users on same project
+│   ├── load-client-project.js          # Isolated project load tests
+│   └── load-candidate-assessment.js    # Candidate-focused load tests
+│
+├── 📁 scripts/            # Node.js orchestration & automation
+│   ├── run.js                          # Generic k6 runner with .env integration
+│   ├── run-shared-project-load.js      # 2-phase shared-project orchestrator
+│   ├── e2e-no-anum-full.js             # Playwright + k6 E2E automation
+│   ├── generate-csv-report.js          # Report generator
+│   └── validate-project.js             # Environment validator
+│
+├── 📁 scenarios/          # Reusable k6 scenario modules
+│   ├── login.js                        # Authentication flows
+│   ├── clientcreation.js               # Organization provisioning
+│   ├── taskcreation.js                 # Activity setup
+│   ├── taskassign.js                   # Activity assignment
+│   └── projectcreation.js              # Project lifecycle
+│
+├── 📁 utils/              # Shared utilities & helpers
+│   ├── common.js                       # Shared logic across tests
+│   ├── http-client.js                  # HTTP wrapper with retries
+│   ├── websocket-client.js             # WebSocket handling
+│   └── ...more utilities
+│
+├── 📁 data/               # Test data & fixtures
+│   ├── candidates.csv                  # Pre-defined candidate pool
+│   ├── personas.js                     # AI persona definitions
+│   ├── taskTemplates.js                # Activity templates
+│   └── conversationScripts.js          # Conversation simulation data
+│
+├── 📁 config/             # Environment configurations
+│   ├── environments.js                 # API endpoints per environment
+│   └── thresholds.js                   # Performance thresholds
+│
+├── 📁 monitoring/         # Grafana + InfluxDB setup
+│   ├── docker-compose.yml              # Monitoring stack
+│   ├── dashboards/
+│   │   └── symulate-k6-live-dashboard.json  # Pre-configured dashboard
+│   ├── grafana-provisioning/           # Auto-provisioning configs
+│   └── GRAFANA_SETUP.md                # Detailed monitoring guide
+│
+├── 📁 playwright/         # Browser automation tests
+│   ├── no-anum-e2e-validation.js       # Full E2E with real browser
+│   └── lib/reporter.js                 # Custom test reporter
+│
+├── 📁 reports/            # Generated test reports (git-ignored)
+│
+├── .env                   # ⚠️ Your secrets (NEVER commit this)
+├── .env.example           # Template for .env setup
+├── package.json           # All npm scripts defined here
+└── README.md              # You are here
+```
+
+### 🔄 How It Works
+
+**For Reviewers: The Complete Flow**
+
+1. **Configuration**: Everything starts from `.env` file (single source of truth)
+2. **Test Selection**: Run specific npm command based on test goal
+3. **Orchestration**: `scripts/run.js` or `run-shared-project-load.js` prepare environment
+4. **Execution**: k6 runs the test scripts with injected environment variables
+5. **Monitoring**: (Optional) Metrics stream to InfluxDB → visualized in Grafana
+6. **Reporting**: Results saved to `reports/` directory
+
+**Example: `npm run load:shared` (10 concurrent users)**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Read .env (NUM_CANDIDATES=10, LOAD_VUS=10)             │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 2. scripts/run-shared-project-load.js starts               │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 1: Provision (Sequential)                            │
+│   • Super Admin login                                       │
+│   • Create 1 Client org                                     │
+│   • Create 6 activities (Role Play, Interview, etc.)        │
+│   • Create 1 Project with all activities                    │
+│   • Provision 10 unique candidates from candidates.csv      │
+│   • Send invitations → Project becomes ACTIVE               │
+│   • Capture all 10 invitation URLs                          │
+│   ⏱️ Duration: ~1 minute                                    │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Wait 65 seconds (rate limit cooldown)                      │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 2: Concurrent Load (Parallel)                        │
+│                                                             │
+│   VU 1 (john1@) ──┐                                        │
+│   VU 2 (john2@) ──┤                                        │
+│   VU 3 (john3@) ──┤                                        │
+│   VU 4 (john4@) ──┤ → All log in via invitation URL       │
+│   VU 5 (john5@) ──┤ → Each performs 5-6 activities        │
+│   VU 6 (john6@) ──┤ → WebSocket conversations             │
+│   VU 7 (john7@) ──┤ → Mark activities COMPLETED           │
+│   VU 8 (john8@) ──┤                                        │
+│   VU 9 (john9@) ──┤                                        │
+│   VU 10(john10@) ─┘                                        │
+│                                                             │
+│   ⏱️ Duration: ~2 minutes (concurrent execution)            │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Results                                                  │
+│   • 100% checks passed ✓                                    │
+│   • 10 iterations completed                                 │
+│   • 60 WebSocket sessions (10 VUs × 6 activities)          │
+│   • Metrics in InfluxDB (if Grafana enabled)               │
+│   • HTML report in reports/ directory                       │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -98,12 +237,60 @@ ANUM_API_ENABLED=false
 
 ## 4. Quick Start — Which Command to Use
 
-| Goal | Command | What to set in .env |
-|------|---------|-------------------|
-| Verify everything works | `npm run smoke` | `LOAD_MODE=smoke`, `SEND_PROJECT_INVITATIONS=true`, `CANDIDATE_EXECUTION_SOURCE=generated` |
-| **Test N concurrent users** | **`npm run load:shared`** | `NUM_CANDIDATES=N`, `LOAD_VUS=N` |
-| Test N isolated projects | `npm run load` | `LOAD_MODE=load`, `LOAD_VUS=N`, `LOAD_ITERATIONS_PER_VU=1` |
-| Anam outage test | `npm run e2e:anam:outage503` | `NUM_CANDIDATES=10` |
+### 🎯 Common Test Scenarios
+
+| Your Goal | Command | Duration | What It Does |
+|-----------|---------|----------|--------------|
+| **Quick validation** | `npm run smoke` | 30s | 1 user completes full flow |
+| **10 concurrent users** | `npm run load:shared` | 3min | 10 users on same project |
+| **50 concurrent users** | `npm run load:shared` | 4min | Configure NUM_CANDIDATES=50 in .env |
+| **150 concurrent users** | `npm run load:shared` | 7min | Configure NUM_CANDIDATES=150 in .env |
+| **Live monitoring** | `npm run load:shared:grafana` | 3min | With real-time Grafana dashboard |
+| **Isolated projects** | `npm run load` | 5min | Each VU creates own project |
+| **AI outage test** | `npm run e2e:anam:outage503` | 10min | Validates resilience during AI downtime |
+
+### 📋 All Available Commands
+
+#### Core Testing
+```bat
+npm run smoke                    # Single-user validation (1 VU)
+npm run load:shared              # Concurrent users on shared project (PRIMARY)
+npm run load:shared:admin        # Same as load:shared (alias)
+npm run load                     # Isolated projects (1 project per VU)
+npm run load:client-project      # Client-specific load test
+npm run load:candidate           # Candidate-focused load test
+```
+
+#### Grafana-Enabled Testing
+```bat
+npm run load:shared:grafana      # Shared load with live metrics ⭐
+npm run admin:shared:grafana     # Same as above (alias)
+npm run smoke:grafana            # Smoke test with live metrics
+npm run load:grafana             # Isolated load with live metrics
+npm run load:grafana:no-anum     # Without Anam API
+```
+
+#### Anam AI Validation
+```bat
+npm run e2e:anam:disabled        # Anam disabled flow
+npm run e2e:anam:healthy         # Anam enabled & healthy
+npm run e2e:anam:outage503       # Mid-session 503 outage simulation
+npm run e2e:anam:network         # Network failure simulation
+```
+
+#### Monitoring
+```bat
+npm run monitoring:up            # Start Grafana + InfluxDB
+npm run monitoring:down          # Stop monitoring stack
+npm run monitoring:status        # Check container status
+npm run monitoring:reset         # Clear all data & restart
+```
+
+#### Utilities
+```bat
+npm run validate                 # Validate .env configuration
+npm run report:csv               # Generate CSV reports from results
+```
 
 ---
 
@@ -171,7 +358,26 @@ LOAD_VUS=10                # must equal NUM_CANDIDATES
 LOAD_MAX_DURATION=10m
 SEND_PROJECT_INVITATIONS=false   # runner sets this to true internally
 ENFORCE_BOOKING=false
+LOAD_TEST_INITIAL_GAP_SECONDS=65  # let an earlier global-IP limiter window expire
+LOAD_TEST_PHASE_GAP_SECONDS=65    # separate provisioning traffic from measured load
+LOAD_VU_START_INTERVAL_SECONDS=1.5
+HTTP_429_MAX_RETRIES=0             # don't amplify throttling during a load run
 ```
+
+For a **local-only** backend started with `NODE_ENV=local`, add
+`EXPOSE_CANDIDATE_PORTAL_LINKS=true` to the backend environment and restart it.
+The invitation endpoint only includes candidate bearer links in its response
+for `NODE_ENV=dev`, or for `NODE_ENV=local` when this explicit opt-in is true.
+Do not enable this flag in UAT/production. The runner redacts returned links and
+tokens from terminal output while retaining them in memory for Phase 2.
+
+Capacity testing and rate-limit testing are separate runs. The backend's default
+`RATE_LIMIT_MAX=100` can reject a full multi-activity run because all VUs share
+one source IP. For local/staging **capacity testing only**, use a test-only
+allowance such as `RATE_LIMIT_MAX=2000` with `RATE_LIMIT_WINDOW=60`; keep the
+production limit and auth/invitation abuse limits unchanged. Restore the normal
+staging value after the run. If you want to validate rate limiting, run that
+scenario separately with the normal limits.
 
 ```bat
 npm run load:shared
@@ -190,7 +396,7 @@ Super Admin
   → Capture all invitation hrefs → save to temp file
 ```
 
-**Phase 2 — Concurrent load (all VUs fire simultaneously):**
+**Phase 2 — Concurrent load (VU starts are paced by the configured interval):**
 ```
 VU 1  → john1@ → invitation href login → 6 activities ✓
 VU 2  → john2@ → invitation href login → 6 activities ✓
@@ -229,7 +435,8 @@ iterations: 10
 | Log message | Cause | Impact |
 |------------|-------|--------|
 | `candidate portal theme: 500` | DB race condition on first concurrent portal access | Non-blocking |
-| `portal-tokens: 404` | Not available on dev | Auto-fallback to invitation-href login |
+| `portal-tokens: 404` | Deprecated endpoint; shared-load setup no longer calls it | Candidate token comes from invitation response links |
+| No candidate hrefs captured | Backend is local without `EXPOSE_CANDIDATE_PORTAL_LINKS=true`, or invitation response omitted links | Enable the local-only opt-in and restart backend; the script now aborts before Phase 2 if no href exists |
 | `Accept Agreement: timeout` | Server overwhelmed at 10+ concurrent | Some VUs retry and succeed |
 | `http_req_failed > 10%` | Dev server rate limits | Expected finding |
 
@@ -398,16 +605,91 @@ All report files are Git-ignored.
 
 ## 12. Grafana / InfluxDB Monitoring
 
+### Quick Start (3 steps)
+
 ```bat
+# Step 1: Start monitoring stack
 npm run monitoring:up
+
+# Step 2: Run any test with Grafana output
+npm run load:shared:grafana
+# OR
+npm run admin:shared:grafana
+# OR
 npm run smoke:grafana
+
+# Step 3: Open dashboard
 ```
 
-Access dashboard: `http://localhost:3000`
+Access live dashboard: **http://localhost:3000** (admin/admin)
 
+### Available Grafana Commands
+
+| Command | Purpose |
+|---------|---------|
+| `npm run monitoring:up` | Start Grafana + InfluxDB containers |
+| `npm run monitoring:down` | Stop monitoring stack |
+| `npm run monitoring:status` | Check if containers are running |
+| `npm run monitoring:reset` | Remove all data & restart fresh |
+| `npm run load:shared:grafana` | Shared-project load with live metrics |
+| `npm run admin:shared:grafana` | Same as above (alias) |
+| `npm run smoke:grafana` | Smoke test with live metrics |
+| `npm run load:grafana` | Isolated load test with live metrics |
+
+### What You'll See in Dashboard
+
+The dashboard shows **8 live panels** during test execution:
+
+1. **Virtual Users (VUs)** - Active concurrent users over time
+2. **Requests/sec** - HTTP request rate
+3. **p95/p99 Response Time** - 95th and 99th percentile latencies
+4. **Error Rate (%)** - Failed requests percentage
+5. **p95 Response Time by Step** - Latency breakdown by API endpoint
+6. **Checks Pass Rate (%)** - Test assertion success rate
+7. **Data Received/Sent** - Network throughput
+8. **Total Stats** - Cumulative metrics (requests, data, checks)
+
+### Metrics Flow
+
+```
+k6 Test Run
+     ↓
+InfluxDB (port 8087)
+     ↓
+Grafana Dashboard (port 3000)
+     ↓
+Real-time visualization
+```
+
+**Metrics push interval**: Every 3 seconds  
+**Data retention**: Persists until `npm run monitoring:reset`
+
+### Troubleshooting
+
+**Dashboard shows "No Data"?**
 ```bat
-npm run monitoring:down
+# Check containers are running
+npm run monitoring:status
+
+# Verify InfluxDB has data
+docker exec symulate-influxdb influx -execute "SHOW DATABASES"
+docker exec symulate-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"
 ```
+
+**Containers won't start?**
+```bat
+# Check Docker is running
+docker --version
+
+# Check ports are free
+netstat -an | findstr "3000 8087"
+
+# Reset everything
+npm run monitoring:reset
+npm run monitoring:up
+```
+
+For complete Grafana setup guide, see: **[monitoring/GRAFANA_SETUP.md](monitoring/GRAFANA_SETUP.md)**
 
 ---
 
@@ -449,3 +731,87 @@ ENFORCE_BOOKING=false
 ```bat
 npm run load:shared
 ```
+
+
+---
+
+## 🔍 For Code Reviewers
+
+### Key Implementation Details
+
+**1. Two-Phase Architecture (`scripts/run-shared-project-load.js`)**
+- Phase 1 provisions project sequentially (avoids rate limits)
+- Phase 2 runs concurrent load with pre-captured invitation URLs
+- Base64 encoding used to pass large invitation data between phases
+- Automatic cleanup of temporary files
+
+**2. Environment Variable Injection**
+- `scripts/run.js` reads `.env` and injects as k6 `-e` flags
+- Oversized values (>4000 chars) written to temp files to avoid Windows ARG_MAX limits
+- All tests use same environment abstraction
+
+**3. WebSocket Handling (`utils/websocket-client.js`)**
+- Simulates real AI conversation flow
+- Staggered connection timing (prevents thundering herd)
+- Automatic reconnection with exponential backoff
+- Conversation state management per VU
+
+**4. Retry Logic (`utils/http-client.js`)**
+- 429 rate limits: 3 retries with exponential backoff
+- Detailed logging shows which endpoint is rate-limited
+- Configurable via `HTTP_429_MAX_RETRIES` in .env
+
+**5. Rate Limit Management**
+- 65-second gaps between phases (global IP rate limit window)
+- VU start interval: 1.5s (controlled candidate onboarding)
+- Admin operations use shared token across all VUs
+
+**6. Grafana Integration**
+- `--grafana` flag adds InfluxDB output to k6 runs
+- 3-second push interval for near-real-time metrics
+- Dashboard auto-provisions via Docker volume mounts
+
+**7. Data Isolation**
+- Each test run uses unique timestamp-based IDs
+- Candidates created with `john{N}.load.{timestamp}.{vu}@yopmail.com` pattern
+- Projects tagged for easy identification
+
+**8. Error Handling**
+- Graceful degradation on booking API 404 (dev environment)
+- Portal theme 500 errors logged but don't fail test
+- WebSocket failures retry with circuit breaker pattern
+
+### Performance Characteristics
+
+| Scale | Phase 1 Duration | Phase 2 Duration | Total Time | Memory Usage |
+|-------|------------------|------------------|------------|--------------|
+| 10 VUs | ~60s | ~120s | ~3min | ~200MB |
+| 50 VUs | ~120s | ~180s | ~7min | ~500MB |
+| 150 VUs | ~300s | ~300s | ~12min | ~1GB |
+
+### Security Notes
+
+- `.env` file is Git-ignored (contains credentials)
+- Invitation tokens redacted in console output
+- Session tokens logged but marked with `<redacted>` in reports
+- No credentials hardcoded in source code
+
+### Testing Philosophy
+
+1. **Smoke first**: Always validate with `npm run smoke` before load testing
+2. **Incremental scale**: Start with 10 VUs, then 50, then 150
+3. **Monitor live**: Use Grafana during load tests to spot issues early
+4. **Verify results**: Check `reports/` directory after each run
+5. **Clean state**: Use `monitoring:reset` between major test runs
+
+---
+
+## 📞 Support & Contribution
+
+For issues or questions:
+1. Check [Common Mistakes & Fixes](#10-common-mistakes--fixes)
+2. Review [monitoring/GRAFANA_SETUP.md](monitoring/GRAFANA_SETUP.md) for Grafana issues
+3. Run `npm run validate` to check environment setup
+
+**Project maintained by**: Symulate AI Engineering Team  
+**Last updated**: January 2025
