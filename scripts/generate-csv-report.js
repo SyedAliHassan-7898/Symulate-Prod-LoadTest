@@ -100,6 +100,19 @@ function extractMetricsSummary(data) {
 function main() {
   const { sourceReport, data } = loadLatestReport();
   const metrics = data.metrics || {};
+  
+  // Validate that test has meaningful data (not just setup phase)
+  const totalRequests = metricValue(metrics.http_reqs, 'count');
+  const totalIterations = metricValue(metrics.iterations, 'count');
+  
+  if (totalRequests === 0 && totalIterations === 0) {
+    console.log('\n⚠️  Skipping CSV report generation:');
+    console.log(`   Test "${sourceReport.name}" has no HTTP requests or iterations.`);
+    console.log('   This appears to be a setup-only or empty test run.');
+    console.log('   CSV reports are generated only for tests with actual load data.\n');
+    process.exit(0);
+  }
+  
   const rows = requestRows(data);
   const baseName = sourceReport.name.replace(/^report-/, 'symulate-report-').replace(/\.json$/i, '');
   const generatedAt = new Date().toISOString();
