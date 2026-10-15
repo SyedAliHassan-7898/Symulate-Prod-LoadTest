@@ -290,6 +290,24 @@ async function main() {
     console.warn(`⚠ Could not generate CSV reports: ${err.message}`);
   }
 
+  // Generate Professional HTML report automatically
+  console.log('\n=== Generating Professional HTML Report ===\n');
+  try {
+    const professionalReportScript = path.join(ROOT, 'scripts', 'generate-professional-report.js');
+    const htmlReportResult = spawnSync('node', [professionalReportScript], {
+      cwd: ROOT,
+      stdio: 'inherit',
+      shell: false
+    });
+    if (htmlReportResult.status === 0) {
+      console.log('\n✓ Professional HTML report generated successfully');
+    } else {
+      console.warn('\n⚠ Professional HTML report generation failed (non-fatal)');
+    }
+  } catch (err) {
+    console.warn(`⚠ Could not generate professional HTML report: ${err.message}`);
+  }
+
   const finalCode = phase2.code !== 0 ? 1 : 0;
   console.log(`\n=== All phases complete — Phase1=${phase1.code}, Phase2=${phase2.code}, final=${finalCode} ===`);
   process.exit(finalCode);

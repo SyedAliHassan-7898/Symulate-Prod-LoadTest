@@ -290,6 +290,7 @@ npm run monitoring:reset         # Clear all data & restart
 ```bat
 npm run validate                 # Validate .env configuration
 npm run report:csv               # Generate CSV reports from results
+npm run report:professional      # Generate professional HTML report
 ```
 
 ---
@@ -692,6 +693,172 @@ start reports\shared-admin-candidate-load-*.html
 # Open in Excel
 start reports\symulate-report-*-url-details.csv
 ```
+
+**Professional HTML Report:**
+```bat
+# Open comprehensive report in browser (Windows)
+start reports\PROFESSIONAL-*.html
+```
+
+---
+
+## Professional Load Test Reports
+
+Every test automatically generates a **comprehensive, industry-standard HTML report** with:
+
+### 9-Section Report Structure
+
+#### 1. 📊 Executive Summary
+- Test objective and scope
+- Test duration and environment
+- Key performance metrics (requests, throughput, response time)
+- Critical issues count with severity breakdown
+
+#### 2. ⚙️ Test Configuration
+- Environment (staging/prod)
+- Virtual Users (VUs)
+- Test duration
+- Scenario details
+
+#### 3. 📈 Summary Graphs & Charts
+- Response time distribution
+- Data transfer visualization
+- *Note: Charts show test totals; see Grafana for real-time graphs*
+
+#### 4. 🎯 Performance Metrics
+
+**HTTP Metrics:**
+- Total requests
+- Requests/sec rate
+- Response time percentiles (p50, p90, p95, p99)
+- Connection time breakdown (connecting, TLS handshaking, sending, waiting, receiving)
+
+**WebSocket Metrics:**
+- Active sessions
+- Messages sent/received
+- Session duration
+
+**Throughput:**
+- Data received/sent
+- Network efficiency
+
+#### 5. 🔍 Endpoint Analysis
+- Per-URL performance breakdown
+- Request counts per endpoint
+- Response time statistics (avg/median/min/max/p90/p95/p99)
+- *Links to detailed url-details.csv*
+
+#### 6. ⚠️ Detailed Findings
+
+**Automatic Issue Detection** with severity classification:
+
+| Severity | Badge Color | Error Rate | p95 Response Time |
+|----------|-------------|------------|-------------------|
+| 🔴 **Critical** | Red | >5% | >3000ms |
+| 🟠 **High** | Orange | >2% | >2000ms |
+| 🟡 **Medium** | Yellow | >1% | >1000ms |
+| 🟢 **Low** | Green | <1% | <1000ms |
+
+**Each finding includes:**
+- Description of the issue
+- Evidence (actual metrics)
+- Actionable recommendations
+
+**Example Finding:**
+```
+⚠️ HIGH - High Error Rate (3.2%)
+
+Evidence:
+- Error rate: 3.2% (5 failed / 171 total)
+- Threshold: 2%
+
+Recommendations:
+- Investigate server logs for 5xx errors
+- Check database connection pool
+- Review rate limiting configuration
+```
+
+#### 7. ✅ Test Validation
+- Total checks performed
+- Pass/fail counts
+- Pass percentage
+
+#### 8. 📋 Methodology
+- Test approach and objectives
+- Tools used (k6, Grafana, InfluxDB, Playwright)
+- Test phases (provisioning, load execution)
+- Load pattern description
+
+#### 9. 📎 Appendices
+- Links to all 6 CSV reports
+- Raw JSON data reference
+- Test script information
+- Environment variables
+
+### File Naming Convention
+
+```
+PROFESSIONAL-{original-report-name}.html
+```
+
+**Example:**
+```
+reports/
+├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html  (k6 native)
+├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json  (raw data)
+├── PROFESSIONAL-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html  ⭐
+├── symulate-report-...-overview.csv
+├── symulate-report-...-summary.csv
+├── symulate-report-...-aggregate.csv
+├── symulate-report-...-checks.csv
+├── symulate-report-...-url-details.csv
+└── symulate-report-...-all-metrics.csv
+```
+
+### Auto-Generation
+
+Professional reports are **automatically generated** after every test run:
+
+```bat
+npm run load:shared          # ✓ Auto-generates professional report
+npm run smoke:grafana        # ✓ Auto-generates professional report
+npm run load:shared:grafana  # ✓ Auto-generates professional report
+```
+
+### Manual Generation
+
+Regenerate professional report from latest JSON:
+
+```bat
+npm run report:professional
+```
+
+### Report Features
+
+**Responsive Design:**
+- Mobile-friendly layout
+- Print-optimized CSS
+- Collapsible sections
+
+**Color-Coded Severity:**
+- Critical: Red (#dc3545)
+- High: Orange (#fd7e14)
+- Medium: Yellow (#ffc107)
+- Low: Green (#28a745)
+
+**Executive-Ready:**
+- Non-technical executive summary
+- Visual metric presentation
+- Clear actionable findings
+- Professional formatting
+
+### Use Cases
+
+1. **Stakeholder Reports** - Share with management/clients
+2. **Performance Baseline** - Document performance benchmarks
+3. **Regression Testing** - Compare against previous runs
+4. **Capacity Planning** - Evidence for infrastructure decisions
+5. **Post-Mortem Analysis** - Detailed incident investigation
 
 ### Playwright Artifacts
 
