@@ -45,7 +45,7 @@ function readEnv() {
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-function k6(script, env) {
+function k6(script, env, extraArgs = []) {
   const args = ['run'];
   const MAX_ARG_LEN = 4000;
   const tempFiles = [];
@@ -67,9 +67,12 @@ function k6(script, env) {
     if (!ENV_KEY_RE.test(k)) return; // skip invalid keys silently
     args.push('-e', `${k}=${v}`);
   });
+  
+  // Add extra args (like Grafana output)
+  args.push(...extraArgs);
 
   args.push(script);
-  console.log(`\n>>> k6 run ${script} (${Object.keys(safeEnv).length} env keys)\n`);
+  console.log(`\n>>> k6 run ${script} (${Object.keys(safeEnv).length} env keys${extraArgs.length ? ' + ' + extraArgs.length + ' extra args' : ''})\n`);
 
   const result = spawnSync('k6', args, {
     cwd: ROOT,
@@ -121,6 +124,9 @@ function redactSessionSecrets(output) {
 
 async function main() {
   const fileEnv = readEnv();
+  
+  // Check for --grafana flag
+  const enableGrafana = process.argv.includes('--grafana');
 
   // Config — always read from .env file; cross-env / npm script defaults are ignored
   const NUM_CANDIDATES    = Number(fileEnv.NUM_CANDIDATES    || 10);
@@ -134,6 +140,9 @@ async function main() {
   console.log(`  NUM_CANDIDATES = ${NUM_CANDIDATES}  (project provisioning)`);
   console.log(`  LOAD_VUS       = ${LOAD_VUS}  (concurrent assessment VUs)`);
   console.log(`  MAX_DURATION   = ${LOAD_MAX_DURATION}`);
+  if (enableGrafana) {
+    console.log(`  GRAFANA        = ENABLED (live monitoring)`);
+  }
   console.log('============================================================\n');
 
   // ── PHASE 1: provision one project with all candidates ─────────────────────
@@ -161,8 +170,13 @@ async function main() {
     ENABLE_TEARDOWN:            'false',   // keep resources for Phase 2
     E2E_EMIT_SESSION_SECRETS:   'false'    // links are parsed from the invitation response; don't emit raw tokens
   };
+  
+  // Grafana output args for both phases
+  const grafanaArgs = enableGrafana 
+    ? ['--out', 'influxdb=http://localhost:8087/k6', '-e', 'K6_INFLUXDB_PUSH_INTERVAL=3s']
+    : [];
 
-  const phase1 = k6('tests/smoke-no-anum-setup.js', phase1Env);
+  const phase1 = k6('tests/smoke-no-anum-setup.js', phase1Env, grafanaArgs);
 
   if (phase1.code !== 0) {
     console.error('\nPhase 1 failed. Aborting.\n');
@@ -253,7 +267,7 @@ async function main() {
     ANAM_MODE:                fileEnv.ANAM_MODE || 'disabled'
   };
 
-  const phase2 = k6('tests/shared-project-admin-candidate-load.js', phase2Env);
+  const phase2 = k6('tests/shared-project-admin-candidate-load.js', phase2Env, grafanaArgs);
 
   // Cleanup temp file
   try { fs.unlinkSync(hrefsTmpPath); } catch (_) {}
