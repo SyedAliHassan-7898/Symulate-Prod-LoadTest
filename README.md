@@ -1015,6 +1015,18 @@ time,value,url,name,method,status
 - 📈 Compatible with Excel pivot tables
 - 🎯 Same data Grafana visualizes
 
+**📊 Excel Analysis Guide:**
+
+For detailed Excel Pivot Table tutorials and data analysis techniques, see:
+**[docs/EXCEL_ANALYSIS_GUIDE.md](docs/EXCEL_ANALYSIS_GUIDE.md)**
+
+Learn how to:
+- Create URLs by Response Time analysis
+- Track Errors by Time Period
+- Visualize Load Patterns
+- Analyze Performance Trends
+- Build automated dashboards
+
 ---
 
 ## Recommended Configurations
