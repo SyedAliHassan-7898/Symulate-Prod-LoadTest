@@ -272,6 +272,24 @@ async function main() {
   // Cleanup temp file
   try { fs.unlinkSync(hrefsTmpPath); } catch (_) {}
 
+  // Generate CSV reports automatically
+  console.log('\n=== Generating CSV reports ===\n');
+  try {
+    const reportGenScript = path.join(ROOT, 'scripts', 'generate-csv-report.js');
+    const reportResult = spawnSync('node', [reportGenScript], {
+      cwd: ROOT,
+      stdio: 'inherit',
+      shell: false
+    });
+    if (reportResult.status === 0) {
+      console.log('\n✓ CSV reports generated successfully');
+    } else {
+      console.warn('\n⚠ CSV report generation failed (non-fatal)');
+    }
+  } catch (err) {
+    console.warn(`⚠ Could not generate CSV reports: ${err.message}`);
+  }
+
   const finalCode = phase2.code !== 0 ? 1 : 0;
   console.log(`\n=== All phases complete — Phase1=${phase1.code}, Phase2=${phase2.code}, final=${finalCode} ===`);
   process.exit(finalCode);
