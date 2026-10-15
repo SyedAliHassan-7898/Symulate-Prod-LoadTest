@@ -81,7 +81,7 @@ function k6(script, env) {
   for (const tmp of tempFiles) { try { fs.unlinkSync(tmp); } catch (_) {} }
 
   const output = `${result.stdout || ''}${result.stderr || ''}`;
-  process.stdout.write(output);
+  process.stdout.write(redactSessionSecrets(output));
   if (result.error) console.error(`k6 spawn error: ${result.error.message}`);
   return { code: result.status == null ? 1 : result.status, out: output };
 }
@@ -107,6 +107,16 @@ function parseLongVar(output, key) {
   return null;
 }
 
+// Invitation hrefs contain bearer credentials. Keep raw output in memory for
+// parsing, but never print those credentials to the terminal/log file.
+function redactSessionSecrets(output) {
+  return String(output)
+    .replace(/(NOANUMTEST_CANDIDATE_INVITATION_HREF=)[^\s"\\]+/g, '$1<redacted>')
+    .replace(/(NOANUMTEST_AUDIT_INVITATION_HREFS=)[A-Za-z0-9+/=]+/g, '$1<redacted>')
+    .replace(/(CANDIDATE_ACCESS_TOKEN=)[^\s"\\]+/g, '$1<redacted>')
+    .replace(/(CANDIDATE_REFRESH_TOKEN=)[^\s"\\]+/g, '$1<redacted>');
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -116,6 +126,8 @@ async function main() {
   const NUM_CANDIDATES    = Number(fileEnv.NUM_CANDIDATES    || 10);
   const LOAD_VUS          = Number(fileEnv.LOAD_VUS          || 10);
   const LOAD_MAX_DURATION =        fileEnv.LOAD_MAX_DURATION || '10m';
+  const PHASE_GAP_SECONDS = Math.max(0, Number(fileEnv.LOAD_TEST_PHASE_GAP_SECONDS || 65));
+  const INITIAL_GAP_SECONDS = Math.max(0, Number(fileEnv.LOAD_TEST_INITIAL_GAP_SECONDS || 65));
 
   console.log('\n============================================================');
   console.log(`Shared-Project Load Test`);
@@ -127,6 +139,13 @@ async function main() {
   // ── PHASE 1: provision one project with all candidates ─────────────────────
   console.log('=== Phase 1/2 — k6: provision shared project + candidates ===\n');
 
+  // Clear requests from earlier local runs; the IP limiter bucket is shared
+  // across scripts and does not reset when a new k6 process starts.
+  if (INITIAL_GAP_SECONDS > 0) {
+    console.log(`Waiting ${INITIAL_GAP_SECONDS}s for the previous rate-limit window to clear...`);
+    await new Promise((resolve) => setTimeout(resolve, INITIAL_GAP_SECONDS * 1000));
+  }
+
   const phase1Env = {
     ...fileEnv,
     LOAD_MODE:                  'smoke',
@@ -135,9 +154,12 @@ async function main() {
     NUM_CANDIDATES:             String(NUM_CANDIDATES),
     SEND_PROJECT_INVITATIONS:   'true',
     SEND_CLIENT_EMAIL:          'false',
+    // Do not multiply setup traffic after a 429; size the staging limiter for
+    // the planned capacity test and keep throttling tests separate.
+    HTTP_429_MAX_RETRIES:       fileEnv.HTTP_429_MAX_RETRIES || '0',
     CANDIDATE_EXECUTION_SOURCE: 'none',    // provision only — no candidate runs
     ENABLE_TEARDOWN:            'false',   // keep resources for Phase 2
-    E2E_EMIT_SESSION_SECRETS:   'true'     // emit invitation hrefs
+    E2E_EMIT_SESSION_SECRETS:   'false'    // links are parsed from the invitation response; don't emit raw tokens
   };
 
   const phase1 = k6('tests/smoke-no-anum-setup.js', phase1Env);
@@ -197,7 +219,14 @@ async function main() {
   fs.writeFileSync(hrefsTmpPath, hrefsB64, 'utf-8');
   console.log(`  Hrefs file  : ${hrefsTmpPath}`);
 
-  // ── PHASE 2: 150 concurrent VUs perform activities ─────────────────────────
+  // Phase 1 shares the same source IP and global limiter bucket as Phase 2.
+  // Let that window expire before measuring candidate/admin traffic.
+  if (PHASE_GAP_SECONDS > 0) {
+    console.log(`\nWaiting ${PHASE_GAP_SECONDS}s for the provisioning rate-limit window to clear...`);
+    await new Promise((resolve) => setTimeout(resolve, PHASE_GAP_SECONDS * 1000));
+  }
+
+  // ── PHASE 2: concurrent VUs perform activities ───────────────────────────
   console.log('\n=== Phase 2/2 — k6:  concurrent candidate assessments ===\n');
 
   const actualVUs = Math.min(LOAD_VUS, candidateCount);
@@ -212,9 +241,14 @@ async function main() {
     SHARED_CANDIDATE_HREFS_FILE:  hrefsTmpPath,
     LOAD_VUS:                     String(actualVUs),
     LOAD_MAX_DURATION,
-    SEND_PROJECT_INVITATIONS: 'true',
+    // Invitations were sent in Phase 1 to obtain candidate links.
+    SEND_PROJECT_INVITATIONS: 'false',
     SEND_CLIENT_EMAIL:        'false',
     ENFORCE_BOOKING:          fileEnv.ENFORCE_BOOKING || 'false',
+    // Keep 429s visible instead of amplifying them with retries. Capacity
+    // tests should tune the staging limiter separately from abuse tests.
+    HTTP_429_MAX_RETRIES: fileEnv.HTTP_429_MAX_RETRIES || '0',
+    LOAD_VU_START_INTERVAL_SECONDS: fileEnv.LOAD_VU_START_INTERVAL_SECONDS || '1.5',
     ANUM_API_ENABLED:         fileEnv.ANUM_API_ENABLED || 'false',
     ANAM_MODE:                fileEnv.ANAM_MODE || 'disabled'
   };

@@ -171,7 +171,26 @@ LOAD_VUS=10                # must equal NUM_CANDIDATES
 LOAD_MAX_DURATION=10m
 SEND_PROJECT_INVITATIONS=false   # runner sets this to true internally
 ENFORCE_BOOKING=false
+LOAD_TEST_INITIAL_GAP_SECONDS=65  # let an earlier global-IP limiter window expire
+LOAD_TEST_PHASE_GAP_SECONDS=65    # separate provisioning traffic from measured load
+LOAD_VU_START_INTERVAL_SECONDS=1.5
+HTTP_429_MAX_RETRIES=0             # don't amplify throttling during a load run
 ```
+
+For a **local-only** backend started with `NODE_ENV=local`, add
+`EXPOSE_CANDIDATE_PORTAL_LINKS=true` to the backend environment and restart it.
+The invitation endpoint only includes candidate bearer links in its response
+for `NODE_ENV=dev`, or for `NODE_ENV=local` when this explicit opt-in is true.
+Do not enable this flag in UAT/production. The runner redacts returned links and
+tokens from terminal output while retaining them in memory for Phase 2.
+
+Capacity testing and rate-limit testing are separate runs. The backend's default
+`RATE_LIMIT_MAX=100` can reject a full multi-activity run because all VUs share
+one source IP. For local/staging **capacity testing only**, use a test-only
+allowance such as `RATE_LIMIT_MAX=2000` with `RATE_LIMIT_WINDOW=60`; keep the
+production limit and auth/invitation abuse limits unchanged. Restore the normal
+staging value after the run. If you want to validate rate limiting, run that
+scenario separately with the normal limits.
 
 ```bat
 npm run load:shared
@@ -190,7 +209,7 @@ Super Admin
   → Capture all invitation hrefs → save to temp file
 ```
 
-**Phase 2 — Concurrent load (all VUs fire simultaneously):**
+**Phase 2 — Concurrent load (VU starts are paced by the configured interval):**
 ```
 VU 1  → john1@ → invitation href login → 6 activities ✓
 VU 2  → john2@ → invitation href login → 6 activities ✓
@@ -229,7 +248,8 @@ iterations: 10
 | Log message | Cause | Impact |
 |------------|-------|--------|
 | `candidate portal theme: 500` | DB race condition on first concurrent portal access | Non-blocking |
-| `portal-tokens: 404` | Not available on dev | Auto-fallback to invitation-href login |
+| `portal-tokens: 404` | Deprecated endpoint; shared-load setup no longer calls it | Candidate token comes from invitation response links |
+| No candidate hrefs captured | Backend is local without `EXPOSE_CANDIDATE_PORTAL_LINKS=true`, or invitation response omitted links | Enable the local-only opt-in and restart backend; the script now aborts before Phase 2 if no href exists |
 | `Accept Agreement: timeout` | Server overwhelmed at 10+ concurrent | Some VUs retry and succeed |
 | `http_req_failed > 10%` | Dev server rate limits | Expected finding |
 
