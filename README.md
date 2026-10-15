@@ -291,6 +291,7 @@ npm run monitoring:reset         # Clear all data & restart
 npm run validate                 # Validate .env configuration
 npm run report:csv               # Generate CSV reports from results
 npm run report:professional      # Generate professional HTML report
+npm run report:grafana           # Export InfluxDB/Grafana data to CSV
 ```
 
 ---
@@ -961,6 +962,58 @@ npm run monitoring:up
 ```
 
 For complete Grafana setup guide, see: **[monitoring/GRAFANA_SETUP.md](monitoring/GRAFANA_SETUP.md)**
+
+### Exporting Grafana Data
+
+**Automatic Export** (when using Grafana):
+```bash
+npm run load:shared:grafana    # ✅ Auto-exports InfluxDB data after test
+npm run smoke:grafana           # ✅ Auto-exports InfluxDB data after test
+```
+
+**Manual Export:**
+```bash
+npm run report:grafana
+```
+
+**What Gets Exported:**
+
+1. **grafana-http-requests-*.csv** ⭐
+   - Every HTTP request with **actual full URLs**
+   - Time, URL, Response Time, Status, Method
+   - Complete request-level detail
+
+2. **grafana-metrics-summary-*.csv**
+   - Aggregated metrics (count, mean, min, max, sum)
+   - All HTTP, WebSocket, VU, and iteration metrics
+
+3. **grafana-vus-timeseries-*.csv**
+   - Virtual Users over time (load pattern)
+   - Time-series data for trend analysis
+
+4. **grafana-errors-*.csv**
+   - Failed requests with URLs and timestamps
+   - Empty file = 100% success rate ✅
+
+**Example HTTP Requests CSV:**
+```csv
+time,value,url,name,method,status
+2026-10-15T13:45:01Z,245.3,https://superadmin.symulate-dev.weuno.co/organizations,Create Client,POST,200
+2026-10-15T13:45:02Z,189.7,https://clientadmin.symulate-dev.weuno.co/projects,Create Project,POST,200
+2026-10-15T13:45:03Z,312.5,https://api.symulate-dev.weuno.co/tasks,Create Task,POST,200
+```
+
+**Requirements:**
+- ✅ Monitoring stack must be running (`npm run monitoring:up`)
+- ✅ Test must use `--grafana` flag or `:grafana` npm script
+- ✅ InfluxDB must contain data (test must complete successfully)
+
+**Benefits:**
+- 📊 Actual URLs captured (not just labels)
+- ⏱️ Time-series data for trend analysis
+- 🔍 Request-level granularity
+- 📈 Compatible with Excel pivot tables
+- 🎯 Same data Grafana visualizes
 
 ---
 

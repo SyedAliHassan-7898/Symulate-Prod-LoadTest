@@ -308,6 +308,26 @@ async function main() {
     console.warn(`⚠ Could not generate professional HTML report: ${err.message}`);
   }
 
+  // Export InfluxDB/Grafana data if Grafana was enabled
+  if (enableGrafana) {
+    console.log('\n=== Exporting Grafana/InfluxDB Data ===\n');
+    try {
+      const influxExportScript = path.join(ROOT, 'scripts', 'export-influxdb-data.js');
+      const influxResult = spawnSync('node', [influxExportScript], {
+        cwd: ROOT,
+        stdio: 'inherit',
+        shell: false
+      });
+      if (influxResult.status === 0) {
+        console.log('\n✓ Grafana data exported successfully');
+      } else {
+        console.warn('\n⚠ Grafana data export failed (non-fatal)');
+      }
+    } catch (err) {
+      console.warn(`⚠ Could not export Grafana data: ${err.message}`);
+    }
+  }
+
   const finalCode = phase2.code !== 0 ? 1 : 0;
   console.log(`\n=== All phases complete — Phase1=${phase1.code}, Phase2=${phase2.code}, final=${finalCode} ===`);
   process.exit(finalCode);

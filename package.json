@@ -30,6 +30,7 @@
     "load:review": "node scripts/run.js tests/load-project-review.js LOAD_MODE=load SCENARIO=full LOAD_ITERATIONS_PER_VU=1",
     "report:csv": "node scripts/generate-csv-report.js",
     "report:professional": "node scripts/generate-professional-report.js",
+    "report:grafana": "node scripts/export-influxdb-data.js",
     "monitoring:up": "docker compose -f monitoring/docker-compose.yml up -d",
     "monitoring:down": "docker compose -f monitoring/docker-compose.yml down",
     "monitoring:reset": "docker compose -f monitoring/docker-compose.yml down -v",

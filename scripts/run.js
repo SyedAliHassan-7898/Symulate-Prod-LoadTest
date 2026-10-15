@@ -269,6 +269,27 @@ async function main() {
       } catch (err) {
         console.warn(`⚠ Could not generate professional HTML report: ${err.message}`);
       }
+
+      // Export Grafana/InfluxDB data if Grafana output was used
+      const influxUrl = findInfluxOutput(scriptArgs);
+      if (influxUrl) {
+        console.log('\n=== Exporting Grafana/InfluxDB Data ===\n');
+        try {
+          const influxExportScript = path.join(ROOT, 'scripts', 'export-influxdb-data.js');
+          const influxResult = spawnSync('node', [influxExportScript], {
+            cwd: ROOT,
+            stdio: 'inherit',
+            shell: false
+          });
+          if (influxResult.status === 0) {
+            console.log('\n✓ Grafana data exported successfully');
+          } else {
+            console.warn('\n⚠ Grafana data export failed (non-fatal)');
+          }
+        } catch (err) {
+          console.warn(`⚠ Could not export Grafana data: ${err.message}`);
+        }
+      }
     }
     
     process.exit(code ?? 1);
