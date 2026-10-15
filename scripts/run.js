@@ -233,7 +233,46 @@ async function main() {
     console.error(`[runner] Failed to start k6: ${error.message}`);
     process.exit(2);
   });
-  child.on('exit', (code) => process.exit(code ?? 1));
+  child.on('exit', (code) => {
+    // Generate reports automatically after test completion
+    if (code === 0) {
+      console.log('\n=== Generating CSV reports ===\n');
+      try {
+        const csvReportScript = path.join(ROOT, 'scripts', 'generate-csv-report.js');
+        const csvResult = spawnSync('node', [csvReportScript], {
+          cwd: ROOT,
+          stdio: 'inherit',
+          shell: false
+        });
+        if (csvResult.status === 0) {
+          console.log('\n✓ CSV reports generated successfully');
+        } else {
+          console.warn('\n⚠ CSV report generation failed (non-fatal)');
+        }
+      } catch (err) {
+        console.warn(`⚠ Could not generate CSV reports: ${err.message}`);
+      }
+
+      console.log('\n=== Generating Professional HTML Report ===\n');
+      try {
+        const professionalReportScript = path.join(ROOT, 'scripts', 'generate-professional-report.js');
+        const htmlResult = spawnSync('node', [professionalReportScript], {
+          cwd: ROOT,
+          stdio: 'inherit',
+          shell: false
+        });
+        if (htmlResult.status === 0) {
+          console.log('\n✓ Professional HTML report generated successfully');
+        } else {
+          console.warn('\n⚠ Professional HTML report generation failed (non-fatal)');
+        }
+      } catch (err) {
+        console.warn(`⚠ Could not generate professional HTML report: ${err.message}`);
+      }
+    }
+    
+    process.exit(code ?? 1);
+  });
 }
 
 main().catch((error) => {
