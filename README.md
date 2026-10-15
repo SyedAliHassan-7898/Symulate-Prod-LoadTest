@@ -588,18 +588,122 @@ This tells you exactly which endpoint is being rate-limited. The suite retries u
 
 ## 11. Reports
 
-All runs write to `reports/`:
+All runs automatically generate comprehensive reports in `reports/`:
 
-| File | Content |
-|------|---------|
-| `*.html` | Interactive HTML report |
-| `*.json` | Raw k6 metrics |
-| `*-overview.csv` | High-level summary |
-| `*-checks.csv` | Per-check results |
+### Automatic Report Generation
 
-Playwright artifacts: `playwright/artifacts/`
+Every test (smoke, load, grafana) automatically creates **6 CSV files + HTML + JSON**:
 
-All report files are Git-ignored.
+#### Generated Files:
+
+| File Type | Content | Use Case |
+|-----------|---------|----------|
+| **HTML** | Interactive dashboard | Quick visual review in browser |
+| **JSON** | Raw k6 metrics | Programmatic analysis, CI/CD integration |
+| **-overview.csv** | High-level summary | Executive summary, quick metrics |
+| **-summary.csv** | Per-endpoint JMeter-style | Performance comparison, SLA validation |
+| **-aggregate.csv** | With percentiles (P90/P95/P99) | Detailed latency distribution |
+| **-checks.csv** | All assertion results | Test validation, failure analysis |
+| **-url-details.csv** ⭐ | Complete URL list with metrics | **"Which URLs were hit?"** analysis |
+| **-all-metrics.csv** ⭐ | Every k6 metric | Complete test execution data |
+
+### CSV Report Details
+
+**1. overview.csv** - Executive Summary
+```csv
+Metric,Value
+Report Type,Symulate Load Test Report
+Generated At,2026-10-15T12:17:39Z
+Total Requests,171
+Failed Requests,0
+Failed Request %,0
+Total Checks,282
+Checks Passed %,100
+Total Iterations,10
+Total VUs,10
+Avg Response Time (ms),237.01
+P95 Response Time (ms),451.09
+P99 Response Time (ms),620.57
+Total Data Received (bytes),2447360
+Total Data Sent (bytes),10660
+WebSocket Sessions,50
+WS Messages Sent,640
+WS Messages Received,1190
+```
+
+**2. url-details.csv** ⭐ (NEW!)
+```csv
+URL/Endpoint,# Requests,Avg (ms),Median (ms),Min (ms),Max (ms),P90 (ms),P95 (ms),P99 (ms)
+Login - Client Admin,10,315.2,310.5,290.1,355.8,340.2,350.0,355.0
+Get Project Details,10,201.4,198.5,180.2,250.3,230.5,240.1,248.0
+Create Project Candidate 1/10,10,277.0,270.0,240.0,310.0,295.0,305.0,309.0
+...all endpoints listed...
+```
+**Shows exactly which APIs were called and their performance!**
+
+**3. all-metrics.csv** ⭐ (NEW!)
+```csv
+Metric Name,Count,Rate (%),Avg,Min,Median,Max,P90,P95,P99
+http_reqs,171,0,0,0,0,0,0,0,0
+http_req_duration,171,0,237.01,146.7,198.07,1220,351.81,451.09,620.57
+http_req_failed,0,0,0,0,0,0,0,0,0
+ws_sessions,50,0,0,0,0,0,0,0,0
+ws_msgs_sent,640,0,0,0,0,0,0,0,0
+iterations,10,0,96000,79000,97000,113000,109000,111000,113000
+vus_max,10,0,10,10,10,10,10,10,10
+...complete metrics...
+```
+**Every metric k6 captured, in one file!**
+
+### Example: After Running `npm run load:shared`
+
+```
+reports/
+├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html
+├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-overview.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-summary.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-aggregate.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-checks.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-url-details.csv  ⭐
+└── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-all-metrics.csv  ⭐
+```
+
+### Manual CSV Generation
+
+If you need to regenerate CSVs from an existing JSON report:
+
+```bat
+npm run report:csv
+```
+
+This finds the latest JSON report and generates all 6 CSV files.
+
+### Opening Reports
+
+**HTML Report:**
+```bat
+# Open in browser (Windows)
+start reports\shared-admin-candidate-load-*.html
+```
+
+**CSV Reports:**
+```bat
+# Open in Excel
+start reports\symulate-report-*-url-details.csv
+```
+
+### Playwright Artifacts
+
+Browser automation artifacts stored separately:
+```
+playwright/artifacts/
+├── screenshots/
+├── videos/
+└── traces/
+```
+
+All report files are Git-ignored for security and size.
 
 ---
 
