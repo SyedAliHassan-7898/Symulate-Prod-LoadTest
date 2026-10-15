@@ -17,24 +17,29 @@ function extractHttpRequests(data) {
   const rows = [];
   const metrics = data.metrics || {};
   
-  // Get all http_req_duration metrics grouped by name (URL)
+  // k6 JSON summary captures `name` tag (endpoint labels) but not full URLs by default
+  // Full URLs would require custom tagging in k6 scripts or using --out csv during test
   for (const [metricName, metric] of Object.entries(metrics)) {
-    const match = metricName.match(/^http_req_duration\{name:(.+)\}$/);
-    if (match) {
-      const urlName = match[1];
+    const nameMatch = metricName.match(/^http_req_duration\{name:([^}]+)\}$/);
+    
+    if (nameMatch) {
+      const endpointName = nameMatch[1];
       const samples = Math.round(metricValue(metric, 'count', 0));
       
-      rows.push({
-        url: urlName,
-        samples: samples,
-        avg_ms: round(metricValue(metric, 'avg')),
-        median_ms: round(metricValue(metric, 'med')),
-        min_ms: round(metricValue(metric, 'min')),
-        max_ms: round(metricValue(metric, 'max')),
-        p90_ms: round(metricValue(metric, 'p(90)')),
-        p95_ms: round(metricValue(metric, 'p(95)')),
-        p99_ms: round(metricValue(metric, 'p(99)'))
-      });
+      // Only add if there were actual requests
+      if (samples > 0) {
+        rows.push({
+          endpoint: endpointName,
+          samples: samples,
+          avg_ms: round(metricValue(metric, 'avg')),
+          median_ms: round(metricValue(metric, 'med')),
+          min_ms: round(metricValue(metric, 'min')),
+          max_ms: round(metricValue(metric, 'max')),
+          p90_ms: round(metricValue(metric, 'p(90)')),
+          p95_ms: round(metricValue(metric, 'p(95)')),
+          p99_ms: round(metricValue(metric, 'p(99)'))
+        });
+      }
     }
   }
   
@@ -174,12 +179,14 @@ function main() {
     ...checkRows(data).map((row) => [row.group, row.check, row.passes, row.fails, row.passRate])
   ]);
 
-  // URL Details CSV (NEW!)
+  // URL Details CSV
+  // Note: k6 captures endpoint labels (name tags) not full URLs in JSON summary
+  // For full URLs, use --out csv=file.csv during test execution
   const urlDetails = extractHttpRequests(data);
   writeCsv(urlDetailsPath, [
-    ['URL/Endpoint', '# Requests', 'Avg (ms)', 'Median (ms)', 'Min (ms)', 'Max (ms)', 'P90 (ms)', 'P95 (ms)', 'P99 (ms)'],
+    ['API Endpoint / Operation', '# Requests', 'Avg (ms)', 'Median (ms)', 'Min (ms)', 'Max (ms)', 'P90 (ms)', 'P95 (ms)', 'P99 (ms)'],
     ...urlDetails.map((row) => [
-      row.url,
+      row.endpoint,
       row.samples,
       row.avg_ms,
       row.median_ms,
