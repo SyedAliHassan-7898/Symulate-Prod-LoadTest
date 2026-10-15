@@ -149,6 +149,7 @@ async function main() {
 
   // Parse outputs
   const projectId = parseVar(phase1.out, 'NOANUMTEST_PROJECT_ID');
+  const orgId     = parseVar(phase1.out, 'NOANUMTEST_ORG_ID');
   const auditHrefsB64 = parseVar(phase1.out, 'NOANUMTEST_AUDIT_INVITATION_HREFS');
 
   if (!projectId) {
@@ -207,7 +208,8 @@ async function main() {
   const phase2Env = {
     ...fileEnv,
     SHARED_PROJECT_ID:            projectId,
-    SHARED_CANDIDATE_HREFS_FILE:  hrefsTmpPath,   // path to file — avoids Windows arg limit
+    SHARED_ORG_ID:                orgId || '',     // for admin portal calls
+    SHARED_CANDIDATE_HREFS_FILE:  hrefsTmpPath,
     LOAD_VUS:                     String(actualVUs),
     LOAD_MAX_DURATION,
     SEND_PROJECT_INVITATIONS: 'true',
@@ -217,7 +219,7 @@ async function main() {
     ANAM_MODE:                fileEnv.ANAM_MODE || 'disabled'
   };
 
-  const phase2 = k6('tests/shared-project-candidate-load.js', phase2Env);
+  const phase2 = k6('tests/shared-project-admin-candidate-load.js', phase2Env);
 
   // Cleanup temp file
   try { fs.unlinkSync(hrefsTmpPath); } catch (_) {}
