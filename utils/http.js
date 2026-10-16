@@ -90,8 +90,56 @@ function headers(token, extra = {}) {
 
 // Executes an HTTP call and retries on 429 (rate limit) with exponential backoff.
 // Returns the final response (which may still be 429 if all retries exhausted).
+//
+// Every *final* failure (status >= 400, or a network error) is also emitted as a
+// machine-readable line:
+//   [FAILED_REQUEST] {"name":...,"method":...,"url":...,"status":...,
+//                     "errorCode":...,"message":...,"at":"ISO-8601"}
+// Both runners (scripts/run.js and scripts/run-shared-project-load.js) tee k6's
+// output, collect these lines, and write reports/failures-latest.json — k6's own
+// summary only reports an aggregate failure *rate*, never which call failed or
+// why. Intermediate 429s that later retry successfully are not reported here.
+function emitFailedRequest(name, url, res, networkError) {
+  const request = res && res.request ? res.request : {};
+  const status = res && typeof res.status === 'number' ? res.status : null;
+
+  let message = networkError || '';
+  if (res && res.body) {
+    const body = String(res.body);
+    try {
+      const parsed = JSON.parse(body);
+      message = parsed.message || parsed.error || parsed.errorMessage || body;
+    } catch (_) {
+      message = body;
+    }
+  }
+
+  const record = {
+    name,
+    method: (request.method || 'GET').toUpperCase(),
+    url: (res && res.url) || url,
+    status,
+    errorCode: res && res.errorCode !== undefined ? res.errorCode : null,
+    message: String(message || '').slice(0, 300),
+    at: new Date().toISOString()
+  };
+
+  console.log(`[FAILED_REQUEST] ${JSON.stringify(record)}`);
+}
+
 function requestWithRetry(fn, name, url) {
-  let res = fn();
+  // Guard against thrown transport errors (DNS failure, refused connection,
+  // timeout) so they are recorded as failures instead of only crashing the step.
+  const guarded = () => {
+    try {
+      return fn();
+    } catch (error) {
+      emitFailedRequest(name, url, null, error && error.message ? error.message : String(error));
+      throw error;
+    }
+  };
+
+  let res = guarded();
   if (res && res.status === 429) {
     console.log(`[429 RATE LIMIT] flow="${name}" url="${url}" — Too Many Requests from this IP`);
   }
@@ -99,10 +147,14 @@ function requestWithRetry(fn, name, url) {
     const waitSec = BASE_BACKOFF_SEC * attempt; // 2s, 4s, 6s
     console.log(`[RETRY] ${name} — 429 rate limited on ${url}, retry ${attempt}/${MAX_RETRIES} after ${waitSec}s`);
     sleep(waitSec);
-    res = fn();
+    res = guarded();
     if (res && res.status === 429 && attempt === MAX_RETRIES) {
       console.log(`[429 EXHAUSTED] flow="${name}" url="${url}" — all ${MAX_RETRIES} retries failed, still rate limited`);
     }
+  }
+
+  if (res && typeof res.status === 'number' && res.status >= 400) {
+    emitFailedRequest(name, url, res);
   }
   return res;
 }

@@ -21,6 +21,8 @@ const fs   = require('fs');
 const path = require('path');
 const { parseFailures, writeFailures } = require('./failure-utils');
 
+const { parseFailedRequestLines } = require('../utils/failed-request-line');
+
 const ROOT    = path.resolve(__dirname, '..');
 const ENVFILE = path.join(ROOT, '.env');
 
@@ -157,12 +159,11 @@ async function main() {
   const grafana = detectGrafanaOutput(process.argv);
   const enableGrafana = grafana.enabled;
 
-  // Config — always read from .env file; cross-env / npm script defaults are ignored
-  const NUM_CANDIDATES    = Number(fileEnv.NUM_CANDIDATES    || 10);
-  const LOAD_VUS          = Number(fileEnv.LOAD_VUS          || 10);
-  const LOAD_MAX_DURATION =        fileEnv.LOAD_MAX_DURATION || '10m';
-  const PHASE_GAP_SECONDS = Math.max(0, Number(fileEnv.LOAD_TEST_PHASE_GAP_SECONDS || 65));
-  const INITIAL_GAP_SECONDS = Math.max(0, Number(fileEnv.LOAD_TEST_INITIAL_GAP_SECONDS || 65));
+  const NUM_CANDIDATES    = Number(env.NUM_CANDIDATES    || 10);
+  const LOAD_VUS          = Number(env.LOAD_VUS          || 10);
+  const LOAD_MAX_DURATION =        env.LOAD_MAX_DURATION || '10m';
+  const PHASE_GAP_SECONDS = Math.max(0, Number(env.LOAD_TEST_PHASE_GAP_SECONDS || 65));
+  const INITIAL_GAP_SECONDS = Math.max(0, Number(env.LOAD_TEST_INITIAL_GAP_SECONDS || 65));
 
   console.log('\n============================================================');
   console.log(`Shared-Project Load Test`);
@@ -170,8 +171,9 @@ async function main() {
   console.log(`  LOAD_VUS       = ${LOAD_VUS}  (concurrent assessment VUs)`);
   console.log(`  MAX_DURATION   = ${LOAD_MAX_DURATION}`);
   if (enableGrafana) {
-    console.log(`  GRAFANA        = ENABLED (live monitoring)`);
+    console.log(`  GRAFANA        = ENABLED (live metrics for both phases)`);
   }
+  console.log(`  CLEANUP        = ${cleanupEnabled() ? 'ON — Phase 3 deletes this run\'s org/project/candidates' : 'OFF — resources kept (ENABLE_TEARDOWN=false or --no-cleanup)'}`);
   console.log('============================================================\n');
 
   // Stamp the run start so the InfluxDB exporter can scope its aggregates to
@@ -179,7 +181,7 @@ async function main() {
   const RUN_START_MS = Date.now();
 
   // ── PHASE 1: provision one project with all candidates ─────────────────────
-  console.log('=== Phase 1/2 — k6: provision shared project + candidates ===\n');
+  console.log('=== Phase 1/3 — k6: provision shared project + candidates ===\n');
 
   // Clear requests from earlier local runs; the IP limiter bucket is shared
   // across scripts and does not reset when a new k6 process starts.
@@ -189,7 +191,7 @@ async function main() {
   }
 
   const phase1Env = {
-    ...fileEnv,
+    ...env,
     LOAD_MODE:                  'smoke',
     LOAD_VUS:                   '1',
     LOAD_ITERATIONS_PER_VU:     '1',
@@ -198,9 +200,9 @@ async function main() {
     SEND_CLIENT_EMAIL:          'false',
     // Do not multiply setup traffic after a 429; size the staging limiter for
     // the planned capacity test and keep throttling tests separate.
-    HTTP_429_MAX_RETRIES:       fileEnv.HTTP_429_MAX_RETRIES || '0',
+    HTTP_429_MAX_RETRIES:       env.HTTP_429_MAX_RETRIES || '0',
     CANDIDATE_EXECUTION_SOURCE: 'none',    // provision only — no candidate runs
-    ENABLE_TEARDOWN:            'false',   // keep resources for Phase 2
+    ENABLE_TEARDOWN:            'false',   // keep resources for Phase 2 (Phase 3 deletes them)
     E2E_EMIT_SESSION_SECRETS:   'false'    // links are parsed from the invitation response; don't emit raw tokens
   };
   
@@ -212,14 +214,24 @@ async function main() {
   const phase1 = k6('tests/smoke-no-anum-setup.js', phase1Env, grafanaArgs);
 
   if (phase1.code !== 0) {
-    console.error('\nPhase 1 failed. Aborting.\n');
-    process.exit(phase1.code || 1);
+    // Phase 1 may have created the org/project before failing — still try to
+    // clean up below if we could parse their ids.
+    console.error('\nPhase 1 failed.\n');
   }
 
   // Parse outputs
   const projectId = parseVar(phase1.out, 'NOANUMTEST_PROJECT_ID');
   const orgId     = parseVar(phase1.out, 'NOANUMTEST_ORG_ID');
   const auditHrefsB64 = parseVar(phase1.out, 'NOANUMTEST_AUDIT_INVITATION_HREFS');
+
+  if (phase1.code !== 0) {
+    // Phase 1 can create the org/project and *then* fail (threshold breach,
+    // 429 storm, missing hrefs). Clean up whatever it managed to create so a
+    // failed provisioning run doesn't leak data either.
+    await runCleanupPhase({ projectId, orgId, hrefsTmpPath: null });
+    console.error('\nPhase 1 failed. Aborting.\n');
+    process.exit(mapK6ExitCode(phase1.code));
+  }
 
   if (!projectId) {
     console.error('Could not parse NOANUMTEST_PROJECT_ID from Phase 1 output.');
@@ -274,15 +286,16 @@ async function main() {
   }
 
   // ── PHASE 2: concurrent VUs perform activities ───────────────────────────
-  console.log('\n=== Phase 2/2 — k6:  concurrent candidate assessments ===\n');
+  console.log('\n=== Phase 2/3 — k6:  concurrent candidate assessments ===\n');
 
   const actualVUs = Math.min(LOAD_VUS, candidateCount);
   if (actualVUs < LOAD_VUS) {
     console.warn(`Note: Only ${candidateCount} candidates provisioned; using ${actualVUs} VUs.`);
   }
 
+  const startIntervalSeconds = env.LOAD_VU_START_INTERVAL_SECONDS || '1.5';
   const phase2Env = {
-    ...fileEnv,
+    ...env,
     SHARED_PROJECT_ID:            projectId,
     SHARED_ORG_ID:                orgId || '',     // for admin portal calls
     SHARED_CANDIDATE_HREFS_FILE:  hrefsTmpPath,
@@ -291,14 +304,38 @@ async function main() {
     // Invitations were sent in Phase 1 to obtain candidate links.
     SEND_PROJECT_INVITATIONS: 'false',
     SEND_CLIENT_EMAIL:        'false',
-    ENFORCE_BOOKING:          fileEnv.ENFORCE_BOOKING || 'false',
+    ENFORCE_BOOKING:          env.ENFORCE_BOOKING || 'false',
     // Keep 429s visible instead of amplifying them with retries. Capacity
     // tests should tune the staging limiter separately from abuse tests.
-    HTTP_429_MAX_RETRIES: fileEnv.HTTP_429_MAX_RETRIES || '0',
-    LOAD_VU_START_INTERVAL_SECONDS: fileEnv.LOAD_VU_START_INTERVAL_SECONDS || '1.5',
-    ANUM_API_ENABLED:         fileEnv.ANUM_API_ENABLED || 'false',
-    ANAM_MODE:                fileEnv.ANAM_MODE || 'disabled'
+    HTTP_429_MAX_RETRIES: env.HTTP_429_MAX_RETRIES || '0',
+    // Read by the test — this is what actually paces the ramp.
+    LOAD_VU_START_INTERVAL_SECONDS: startIntervalSeconds,
+    ANUM_API_ENABLED:         env.ANUM_API_ENABLED || 'false',
+    ANAM_MODE:                env.ANAM_MODE || 'disabled'
   };
+  if (grafanaArgs.length && !env.K6_INFLUXDB_PUSH_INTERVAL) {
+    phase2Env.K6_INFLUXDB_PUSH_INTERVAL = '3s';
+  }
+
+  console.log(`  RAMP: VU start interval = ${startIntervalSeconds}s (LOAD_VU_START_INTERVAL_SECONDS)`);
+
+  const phase2 = k6('tests/shared-project-admin-candidate-load.js', phase2Env, grafanaArgs);
+
+  // ── Ramp telemetry ────────────────────────────────────────────────────────
+  // Report measured concurrency instead of inferring it from the ramp formula.
+  const ramp = computePeakExecutingVus(phase2.out);
+  if (ramp) {
+    const interval = Number(startIntervalSeconds);
+    const scheduledSpan = Number.isFinite(interval) ? `${(interval * Math.max(0, ramp.started - 1)).toFixed(0)}s` : 'n/a';
+    console.log(`\n[peak] executing VUs: peak=${ramp.peak} of ${ramp.started} started (ramp span ~${scheduledSpan})`);
+    console.log(`PEAK_CONCURRENT_VUS=${ramp.peak} STARTED_VUS=${ramp.started}`);
+    console.log(
+      '[peak] NOTE — k6\'s builtin "vus" metric counts staggered VUs that are only sleeping; ' +
+      'use this measured number for capacity claims.'
+    );
+  } else {
+    console.warn('[peak] WORK_START/WORK_END telemetry not found in Phase 2 output; peak concurrency unavailable.');
+  }
 
   const phase2 = k6('tests/shared-project-admin-candidate-load.js', phase2Env, grafanaArgs);
 
@@ -375,7 +412,17 @@ async function main() {
   process.exit(finalCode);
 }
 
-main().catch((e) => {
-  console.error('FATAL:', e);
-  process.exit(2);
-});
+// Exported for tests / ad-hoc inspection (scripts/run-shared-project-load.js
+// stays a CLI entry point when invoked directly).
+module.exports = {
+  parseRunnerArgs,
+  computePeakExecutingVus,
+  mapK6ExitCode
+};
+
+if (require.main === module) {
+  main().catch((e) => {
+    console.error('FATAL:', e);
+    process.exit(2);
+  });
+}

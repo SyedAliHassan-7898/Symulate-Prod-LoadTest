@@ -17,6 +17,18 @@
 //   SHARED_CANDIDATE_HREFS_FILE — temp file with base64 hrefs map
 //   SHARED_ORG_ID              — org id for admin portal calls
 //   LOAD_VUS                   — concurrent VUs (default 10)
+//
+// Load-shaping env vars:
+//   LOAD_VU_START_INTERVAL_SECONDS — seconds between VU starts (default 1.5).
+//     Previously hardcoded to 500ms and this variable was ignored, which made
+//     the documented ramp/peak numbers wrong.
+//   PERFORMANCE_PROFILE / ENV_PROFILE — select the pass/fail budgets via
+//     config/thresholds.js, exactly like every other load test in this repo.
+//
+// Ramp telemetry:
+//   Each VU emits `WORK_START` / `WORK_END` log lines. scripts/run-shared-project-load.js
+//   parses them to report the real peak number of *executing* VUs — don't infer
+//   it from the ramp formula.
 
 import { check, sleep } from 'k6';
 import exec from 'k6/execution';
@@ -25,6 +37,7 @@ import { htmlReport } from '../utils/local-report.js';
 import { b64decode } from 'k6/encoding';
 
 import { ANUM_API_ENABLED, SCENARIO, LOAD_MODE } from '../config/environments.js';
+import { buildThresholds } from '../config/thresholds.js';
 import { reportName, log } from '../utils/helpers.js';
 import { getJson, getJsonWithHeaders } from '../utils/http.js';
 import { routes } from '../utils/routes.js';
@@ -39,6 +52,14 @@ import { clientAdminLogin } from '../scenarios/login.js';
 const PROJECT_ID  = __ENV.SHARED_PROJECT_ID;
 const ORG_ID      = __ENV.SHARED_ORG_ID || '';
 const LOAD_VUS    = Math.max(1, Number(__ENV.LOAD_VUS || 10));
+
+// Ramp pacing. This used to be a hardcoded `vuIndex * 500` while the runner
+// exported LOAD_VU_START_INTERVAL_SECONDS that nothing read — so the README's
+// "~64 peak at 1.5s" note described a ramp the test never performed.
+const START_INTERVAL_SECONDS = (() => {
+  const raw = Number(__ENV.LOAD_VU_START_INTERVAL_SECONDS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1.5;
+})();
 
 const CLIENT_ADMIN_HEADERS = {
   'x-base-origin': 'client-admin',
@@ -73,10 +94,16 @@ export const options = {
       gracefulStop: '90s'
     }
   },
-  thresholds: {
-    http_req_failed:   ['rate<0.15'],    // 15% tolerance for dev env
-    http_req_duration: ['p(95)<8000']    // 8s p95 — admin calls are heavier
-  }
+  // Pass/fail budgets come from config/thresholds.js like every other test in
+  // this repo (smoke, load-client-project, load-candidate, load-review), so the
+  // documented gate is real:
+  //   PERFORMANCE_PROFILE=strict npm run load:shared
+  // fails at error rate >= 1%, p95 >= 2s or checks <= 99%.
+  // The previous hardcoded budgets (rate<0.15 / p95<8000) let a run with 14%
+  // failed requests pass, which made every documented SLA claim false.
+  // Loosen per environment with PERFORMANCE_PROFILE / ENV_PROFILE — see
+  // config/thresholds.js for the profile table.
+  thresholds: buildThresholds()
 };
 
 // ── setup() ───────────────────────────────────────────────────────────────────
@@ -109,13 +136,19 @@ export function setup() {
 export default function (data) {
   const { adminToken } = data;
 
-  // Stagger VU starts to avoid thundering herd on rate-limited endpoints.
-  // Each VU waits (vuIndex * 500ms) before starting — 10 VUs spread over 5s.
+  // Ramp pacing — avoid a thundering herd on rate-limited endpoints.
+  // Each VU waits (vuIndex * LOAD_VU_START_INTERVAL_SECONDS) before doing any
+  // work: default 1.5s, so 150 VUs are scheduled over ~225s.
   const vuIndex = (__VU - 1) % candidateEntries.length;
-  const staggerMs = vuIndex * 500;
-  if (staggerMs > 0) {
-    sleep(staggerMs / 1000);
+  const staggerSeconds = vuIndex * START_INTERVAL_SECONDS;
+  if (staggerSeconds > 0) {
+    sleep(staggerSeconds);
   }
+
+  // Teardown/ramp telemetry — parsed by scripts/run-shared-project-load.js to
+  // report the real peak of concurrently *executing* VUs (k6's builtin `vus`
+  // counts sleeping VUs too, so it always reads the full VU count).
+  log('AdminCandidateLoad', `WORK_START vu=${__VU} idx=${vuIndex}`);
 
   const [candidateId, invitationHref] = candidateEntries[vuIndex];
 
@@ -180,6 +213,7 @@ export default function (data) {
 
   if (!candidateToken) {
     log('AdminCandidateLoad', `VU=${__VU}: candidate login failed for candidateId=${candidateId}`);
+    log('AdminCandidateLoad', `WORK_END vu=${__VU} reason=candidate-login-failed`);
     return;
   }
 
@@ -202,6 +236,8 @@ export default function (data) {
     PROJECT_ID,
     invitationHref
   );
+
+  log('AdminCandidateLoad', `WORK_END vu=${__VU} reason=done`);
 
   sleep(1);
 }

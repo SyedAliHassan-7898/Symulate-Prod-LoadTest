@@ -1,0 +1,34 @@
+# Normalise line endings.
+#
+# The repo is developed on Windows (core.autocrlf=true) with no attributes, so
+# commits mixed LF and CRLF and checkouts showed the whole tree as "modified".
+# With these rules Git stores LF in the index and converts on checkout.
+
+* text=auto
+
+*.js      text eol=lf
+*.jsx     text eol=lf
+*.ts      text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.csv     text eol=lf
+*.sh      text eol=lf
+*.example text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf
+
+*.jpg     binary
+*.jpeg    binary
+*.png     binary
+*.gif     binary
+*.webp    binary
+*.ico     binary
+*.pdf     binary
+*.zip     binary
+*.swp     binary

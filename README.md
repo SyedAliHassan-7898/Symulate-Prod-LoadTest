@@ -167,13 +167,13 @@ symulate-load-tests/
 
 ## 1. Prerequisites
 
-| Tool | Purpose |
-|------|---------|
-| Node.js 20+ | Runner scripts |
-| npm | Package management |
-| k6 | Load test execution |
+| Tool           | Purpose                     |
+| -------------- | --------------------------- |
+| Node.js 20+    | Runner scripts              |
+| npm            | Package management          |
+| k6             | Load test execution         |
 | Docker Desktop | Grafana/InfluxDB (optional) |
-| Chromium | Playwright browser tests |
+| Chromium       | Playwright browser tests    |
 
 ```bat
 node --version
@@ -187,7 +187,33 @@ k6 version
 
 ```bat
 npm install
+K6 Installation Windows
+If you use the Chocolatey package manager you can install the unofficial k6 package with:
+
+choco install k6
+If you use the Windows Package Manager, install the official packages from the k6 manifests (created by the community):
+
+winget install k6 --source winget
+Alternatively, you can download and run the latest official installer.
+
+Docker
+Bash
+
+docker pull grafana/k6
+We also have a separate image you can use with chromium installed to run k6 browser tests.
+
+Bash
+
+docker pull grafana/k6:master-with-browser
+
+
+Verify the Installation
+
+Open a new terminal or command prompt window and check the installed version:
+bash
+k6 version
 copy .env.example .env
+winget install k6 --source winget
 ```
 
 Fill `.env` with real credentials. Never commit `.env` — it is Git-ignored.
@@ -245,29 +271,63 @@ ANUM_API_ENABLED=false
 
 ### 🎯 Common Test Scenarios
 
-| Your Goal | Command | Duration | What It Does |
-|-----------|---------|----------|--------------|
-| **Quick validation** | `npm run smoke` | 30s | 1 user completes full flow |
-| **10 concurrent users** | `npm run load:shared` | 3min | 10 users on same project |
-| **50 concurrent users** | `npm run load:shared` | 4min | Configure NUM_CANDIDATES=50 in .env |
-| **150 concurrent users** | `npm run load:shared` | 7min | Configure NUM_CANDIDATES=150 in .env |
-| **Live monitoring** | `npm run load:shared:grafana` | 3min | With real-time Grafana dashboard |
-| **Isolated projects** | `npm run load` | 5min | Each VU creates own project |
-| **AI outage test** | `npm run e2e:anam:outage503` | 10min | Validates resilience during AI downtime |
+| Your Goal                | Command                       | Duration | What It Does                            |
+| ------------------------ | ----------------------------- | -------- | --------------------------------------- |
+| **Quick validation**     | `npm run smoke`               | ~30s     | 1 user completes full flow              |
+| **10 users (concurrent)**| `npm run load:shared`         | ~3min    | 10 users on same project (~10 peak)     |
+| **50 users (ramped)**    | `npm run load:shared`         | ~7min    | NUM_CANDIDATES=50 (~50 peak concurrent) |
+| **150 users (ramped)**   | `npm run load:shared`         | ~12min   | NUM_CANDIDATES=150 (~64 peak — see note)|
+| **Live monitoring**      | `npm run load:shared:grafana` | ~3min    | With real-time Grafana dashboard        |
+| **Isolated projects**    | `npm run load`                | ~5min    | Each VU creates own project             |
+| **AI outage test**       | `npm run e2e:anam:outage503`  | ~10min   | Validates resilience during AI downtime |
+
+> **⚠️ "Concurrent users" vs. total users — read before quoting numbers.**
+> `load:shared` provisions `NUM_CANDIDATES` users and starts them **paced** by
+> `LOAD_VU_START_INTERVAL_SECONDS` (default **1.5s**), not all at once. This
+> variable is read **by the test itself** (it used to be exported by the runner
+> and ignored, while the test hardcoded 500 ms — which is why older peak numbers
+> were wrong). With each VU running ~96s, the *estimated* peak running
+> simultaneously is:
+>
+> ```
+> peak concurrent ≈ VU duration ÷ start interval ≈ 96s ÷ 1.5s ≈ 64
+> ```
+>
+> That is only an estimate — **every run measures the real value** from the
+> per-VU `WORK_START`/`WORK_END` windows and prints it. Quote the measurement,
+> not the formula:
+>
+> ```
+> [peak] executing VUs: peak=64 of 150 started (ramp span ~225s)
+> PEAK_CONCURRENT_VUS=64 STARTED_VUS=150
+> ```
+>
+> (k6's builtin `vus` metric is *not* this number — it counts VUs that are only
+> sleeping through their stagger, so it always reads the full VU count.)
+>
+> So **10 and 50 users are genuinely ~concurrent** (below the cap), but **150 users
+> means 150 total ramped over ~225s with a ~64-user peak** — not 150 simultaneous.
+> To actually hold 150 simultaneous, lower `LOAD_VU_START_INTERVAL_SECONDS`
+> (e.g. `0.5` → ~190 peak), accepting the heavier burst the backend sees, and
+> confirm it from `PEAK_CONCURRENT_VUS=`.
 
 ### 📋 All Available Commands
 
 #### Core Testing
+
 ```bat
 npm run smoke                    # Single-user validation (1 VU)
 npm run load:shared              # Concurrent users on shared project (PRIMARY)
 npm run load:shared:admin        # Same as load:shared (alias)
+npm run load:shared:keep         # Same run, but skip Phase 3 cleanup
+npm run cleanup:shared           # Delete leftovers from an earlier run
 npm run load                     # Isolated projects (1 project per VU)
 npm run load:client-project      # Client-specific load test
 npm run load:candidate           # Candidate-focused load test
 ```
 
 #### Grafana-Enabled Testing
+
 ```bat
 npm run load:shared:grafana      # Shared load with live metrics ⭐
 npm run admin:shared:grafana     # Same as above (alias)
@@ -277,6 +337,7 @@ npm run load:grafana:no-anum     # Without Anam API
 ```
 
 #### Anam AI Validation
+
 ```bat
 npm run e2e:anam:disabled        # Anam disabled flow
 npm run e2e:anam:healthy         # Anam enabled & healthy
@@ -285,6 +346,7 @@ npm run e2e:anam:network         # Network failure simulation
 ```
 
 #### Monitoring
+
 ```bat
 npm run monitoring:up            # Start Grafana + InfluxDB
 npm run monitoring:down          # Stop monitoring stack
@@ -293,12 +355,17 @@ npm run monitoring:reset         # Clear all data & restart
 ```
 
 #### Utilities
+
 ```bat
 npm run validate                 # Validate .env configuration
 npm run report:csv               # Generate CSV reports from results
 npm run report:professional      # Generate professional HTML report
 npm run report:grafana           # Export InfluxDB/Grafana data to CSV
 ```
+
+> `report:professional` and `report:grafana` do **not** exist in `package.json` —
+> the HTML report is written by every run automatically, and there is no
+> InfluxDB→CSV exporter yet.
 
 ---
 
@@ -307,6 +374,7 @@ npm run report:grafana           # Export InfluxDB/Grafana data to CSV
 **Purpose:** Verify the full lifecycle works end-to-end with 1 VU.
 
 ### Required `.env`:
+
 ```env
 LOAD_MODE=smoke
 SEND_PROJECT_INVITATIONS=true
@@ -320,6 +388,7 @@ npm run smoke
 ```
 
 ### What runs:
+
 ```
 1 Super Admin login
 → Create 1 Client (organization)
@@ -334,6 +403,7 @@ npm run smoke
 ```
 
 ### Expected output:
+
 ```
 checks: 100.00% ✓ 90  ✗ 0
 managed_clients_created: 1
@@ -342,11 +412,13 @@ project active: status ACTIVE ✓
 ```
 
 ### Project stays DRAFT?
+
 ```env
 SEND_PROJECT_INVITATIONS=true   ← must be true
 ```
 
 ### Candidates not performing?
+
 ```env
 CANDIDATE_EXECUTION_SOURCE=generated   ← must not be empty or none
 ```
@@ -360,6 +432,7 @@ CANDIDATE_EXECUTION_SOURCE=generated   ← must not be empty or none
 **Purpose:** N unique candidates simultaneously perform all activities on the same project.
 
 ### Required `.env`:
+
 ```env
 NUM_CANDIDATES=10          # set to how many concurrent users you want
 LOAD_VUS=10                # must equal NUM_CANDIDATES
@@ -391,9 +464,10 @@ scenario separately with the normal limits.
 npm run load:shared
 ```
 
-### Two-phase flow:
+### Three-phase flow:
 
 **Phase 1 — Provision (sequential, ~1-5 min):**
+
 ```
 Super Admin
   → Create 1 Client
@@ -405,48 +479,78 @@ Super Admin
 ```
 
 **Phase 2 — Concurrent load (VU starts are paced by the configured interval):**
+
 ```
 VU 1  → john1@ → invitation href login → 6 activities ✓
 VU 2  → john2@ → invitation href login → 6 activities ✓
 VU 3  → john3@ → invitation href login → 6 activities ✓
 ...
 VU N  → johnN@ → invitation href login → 6 activities ✓
+
+[peak] executing VUs: peak=10 of 10 started (ramp span ~14s)
+PEAK_CONCURRENT_VUS=10 STARTED_VUS=10
 ```
+
+**Phase 3 — Cleanup (runs even when Phase 2 fails):**
+
+```
+Super Admin → DELETE 150 candidates → DELETE project → DELETE organisation
+[cleanup] OK — this run left no data behind.
+```
+
+Phase 1 still sets `ENABLE_TEARDOWN=false` internally (so its own teardown does
+not delete the project Phase 2 is about to use); **Phase 3 is what actually
+deletes the run's organisation, project and candidates.** Control it with:
+
+| You want                              | Use                                              |
+| ------------------------------------- | ------------------------------------------------ |
+| auto-clean after every run (default)  | `npm run load:shared`                            |
+| keep the data for inspection          | `npm run load:shared:keep` or `ENABLE_TEARDOWN=false` |
+| clean up leftovers from an older run  | `npm run cleanup:shared SHARED_PROJECT_ID=<id> SHARED_ORG_ID=<id>` |
 
 ### Scale examples:
 
-| `.env` | Concurrent users | Phase 1 time |
-|--------|-----------------|-------------|
-| `NUM_CANDIDATES=5, LOAD_VUS=5` | 5 | ~30s |
-| `NUM_CANDIDATES=10, LOAD_VUS=10` | 10 | ~1 min |
-| `NUM_CANDIDATES=50, LOAD_VUS=50` | 50 | ~2 min |
-| `NUM_CANDIDATES=150, LOAD_VUS=150` | 150 | ~5 min |
+| `.env`                             | Concurrent users | Phase 1 time |
+| ---------------------------------- | ---------------- | ------------ |
+| `NUM_CANDIDATES=5, LOAD_VUS=5`     | 5                | ~30s         |
+| `NUM_CANDIDATES=10, LOAD_VUS=10`   | 10               | ~1 min       |
+| `NUM_CANDIDATES=50, LOAD_VUS=50`   | 50               | ~2 min       |
+| `NUM_CANDIDATES=150, LOAD_VUS=150` | 150              | ~5 min       |
 
 ### Why not `npm run load` for 150 users?
 
-`npm run load` creates one project per VU — 150 VUs = 150 concurrent `Create Client` calls = **mass 429 rate limiting**. `load:shared` creates 1 project then fires all VUs against it — no rate limit on provisioning.
+`npm run load` creates one project per VU — 150 VUs = 150 concurrent `Create Client` calls = **mass 429 rate limiting**. `load:shared` creates **one** project then paces all VUs against it, which **avoids the mass provisioning storm** (no 150 parallel `Create Client` calls). A global per-IP rate limit still applies to the backend, which is why the config uses `LOAD_TEST_INITIAL_GAP_SECONDS` / `LOAD_TEST_PHASE_GAP_SECONDS` cooldowns and a paced VU start — see the required `.env` above.
 
 ### Expected output for 10 VUs:
+
 ```
 Phase 1 complete:
   Project ID  : xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
   Candidates  : 10 hrefs captured
   Hrefs file  : C:\Users\...\AppData\Local\Temp\shared-hrefs-<ts>.b64
+  RAMP: VU start interval = 1.5s (LOAD_VU_START_INTERVAL_SECONDS)
 
 checks: 98%+
 ws_sessions: 60   (10 VUs × 6 activities)
 iterations: 10
+
+[peak] executing VUs: peak=10 of 10 started (ramp span ~14s)
+PEAK_CONCURRENT_VUS=10 STARTED_VUS=10
+
+=== Phase 3/3 — k6: delete project, org and candidates ===
+[cleanup] OK — this run left no data behind.
+=== All phases complete — Phase1=0, Phase2=0, cleanup=ok, final=0 ===
 ```
 
 ### Known dev-environment behaviors (not script bugs):
 
-| Log message | Cause | Impact |
-|------------|-------|--------|
-| `candidate portal theme: 500` | DB race condition on first concurrent portal access | Non-blocking |
-| `portal-tokens: 404` | Deprecated endpoint; shared-load setup no longer calls it | Candidate token comes from invitation response links |
-| No candidate hrefs captured | Backend is local without `EXPOSE_CANDIDATE_PORTAL_LINKS=true`, or invitation response omitted links | Enable the local-only opt-in and restart backend; the script now aborts before Phase 2 if no href exists |
-| `Accept Agreement: timeout` | Server overwhelmed at 10+ concurrent | Some VUs retry and succeed |
-| `http_req_failed > 10%` | Dev server rate limits | Expected finding |
+| Log message                   | Cause                                                                                              | Impact                                                                                                   |
+| ----------------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `candidate portal theme: 500` | DB race condition on first concurrent portal access                                                | Non-blocking                                                                                             |
+| `portal-tokens: 404`          | Deprecated endpoint; shared-load setup no longer calls it                                          | Candidate token comes from invitation response links                                                     |
+| No candidate hrefs captured   | Backend is local without`EXPOSE_CANDIDATE_PORTAL_LINKS=true`, or invitation response omitted links | Enable the local-only opt-in and restart backend; the script now aborts before Phase 2 if no href exists |
+| `Accept Agreement: timeout`   | Server overwhelmed at 10+ concurrent                                                               | Some VUs retry and succeed                                                                               |
+| `http_req_failed > 10%`       | Dev server rate limits                                                                             | **Fails the run now** — `load:shared` is gated by `config/thresholds.js` (default `dev → baseline` = < 1%). Loosen deliberately with `PERFORMANCE_PROFILE=functional` if the environment is the known cause |
 
 ---
 
@@ -455,6 +559,7 @@ iterations: 10
 **Purpose:** Each VU creates its own independent project + candidates.
 
 ### Required `.env`:
+
 ```env
 LOAD_MODE=load
 LOAD_VUS=5
@@ -469,6 +574,7 @@ npm run load
 ```
 
 **With `LOAD_VUS=5`:**
+
 ```
 VU 1 → Client A → Project A → 10 candidates → activities
 VU 2 → Client B → Project B → 10 candidates → activities
@@ -529,6 +635,13 @@ ENFORCE_BOOKING=false     # booking API returns 404 on dev — must be false
 ANUM_API_ENABLED=false    # Anam API disabled on dev
 ```
 
+> **⚠️ Known naming quirk — "Anam" vs "Anum".** The product feature is **"Anam"**
+> (the AI service), but a legacy typo produced the env var **`ANUM_API_ENABLED`**
+> and the `no-anum` npm-script/command suffix. Both spellings therefore appear in
+> the codebase and CLI (`smoke:no-anum`, `ANUM_API_ENABLED`, ...). They refer to the
+> **same thing**. Treat `ANUM_*` as an alias for `ANAM_*` — don't "fix" one without
+> the other or the scripts will break.
+
 ---
 
 ## 10. Common Mistakes & Fixes
@@ -538,6 +651,7 @@ ANUM_API_ENABLED=false    # Anam API disabled on dev
 **Cause:** `LOAD_ITERATIONS_PER_VU` set high (e.g. 10) with multiple VUs.
 
 **Fix:**
+
 ```env
 LOAD_ITERATIONS_PER_VU=1
 ```
@@ -547,6 +661,7 @@ LOAD_ITERATIONS_PER_VU=1
 **Cause:** `SEND_PROJECT_INVITATIONS=false`
 
 **Fix:**
+
 ```env
 SEND_PROJECT_INVITATIONS=true
 ```
@@ -556,6 +671,7 @@ SEND_PROJECT_INVITATIONS=true
 **Cause:** `CANDIDATE_EXECUTION_SOURCE` is empty or `none`
 
 **Fix:**
+
 ```env
 CANDIDATE_EXECUTION_SOURCE=generated
 ```
@@ -565,6 +681,7 @@ CANDIDATE_EXECUTION_SOURCE=generated
 **Cause:** `.env` is the only source of truth — `cross-env` in npm scripts is ignored.
 
 **Fix:** Update `.env` directly:
+
 ```env
 NUM_CANDIDATES=150
 LOAD_VUS=150
@@ -585,12 +702,25 @@ LOAD_VUS=150
 ### 429 Rate Limiting
 
 All HTTP calls now log:
+
 ```
 [429 RATE LIMIT] flow="Create Project Candidate 3/10" url="https://api...."
 [RETRY] ... retry 1/3 after 2s
 ```
 
-This tells you exactly which endpoint is being rate-limited. The suite retries up to 3 times with backoff.
+This tells you exactly which endpoint is being rate-limited. **By default the suite retries up to 3 times with exponential backoff** (`HTTP_429_MAX_RETRIES=3`). Load runs (`load:shared`) deliberately set `HTTP_429_MAX_RETRIES=0` so retries don't amplify throttling during measurement.
+
+### `href token not found ... expected access_token in the email login href` (prod / UAT)
+
+**Cause:** The harness does **not** read the candidate's inbox. It gets the candidate login link from the `accessMyPortal` field that the **invitation API returns** (`scenarios/projectcreation.js` → `allInvitationHrefs`). The backend only populates that field when `EXPOSE_CANDIDATE_PORTAL_LINKS=true` — a local/dev-only opt-in. For `NODE_ENV=dev` the links are included automatically, but **UAT/prod intentionally omit them** (returning candidate bearer tokens in an API response is a security risk).
+
+So pointing `API_URL` at `https://api.symulate.ai/prod/api` makes the invitation response come back **without** candidate portal links → no `access_token` → `candidateSessionFromInviteHref()` returns null → the candidate flow logs the message and returns zero activities. This is **expected in prod**, not a script bug.
+
+**Fix options:**
+
+- Run the candidate-assessment / `load:shared` flow against the **dev** backend (where links are exposed) — this is what the suite is designed for.
+- If you must load-test prod, ask the backend team to enable `EXPOSE_CANDIDATE_PORTAL_LINKS=true` on the prod env **temporarily** (explicit security trade-off), restart it, then rerun Phase 1. Do **not** leave it on in prod.
+- The harness prints this exact hint in shared-load mode when no href is captured, and aborts before Phase 2 rather than running a meaningless load.
 
 ### `href token not found ... expected access_token in the email login href` (prod / UAT)
 
@@ -952,16 +1082,16 @@ Access live dashboard: **http://localhost:3001** (admin/admin)
 
 ### Available Grafana Commands
 
-| Command | Purpose |
-|---------|---------|
-| `npm run monitoring:up` | Start Grafana + InfluxDB containers |
-| `npm run monitoring:down` | Stop monitoring stack |
-| `npm run monitoring:status` | Check if containers are running |
-| `npm run monitoring:reset` | Remove all data & restart fresh |
-| `npm run load:shared:grafana` | Shared-project load with live metrics |
-| `npm run admin:shared:grafana` | Same as above (alias) |
-| `npm run smoke:grafana` | Smoke test with live metrics |
-| `npm run load:grafana` | Isolated load test with live metrics |
+| Command                        | Purpose                               |
+| ------------------------------ | ------------------------------------- |
+| `npm run monitoring:up`        | Start Grafana + InfluxDB containers   |
+| `npm run monitoring:down`      | Stop monitoring stack                 |
+| `npm run monitoring:status`    | Check if containers are running       |
+| `npm run monitoring:reset`     | Remove all data & restart fresh       |
+| `npm run load:shared:grafana`  | Shared-project load with live metrics |
+| `npm run admin:shared:grafana` | Same as above (alias)                 |
+| `npm run smoke:grafana`        | Smoke test with live metrics          |
+| `npm run load:grafana`         | Isolated load test with live metrics  |
 
 ### What You'll See in Dashboard
 
@@ -988,12 +1118,13 @@ Grafana Dashboard (port 3001)
 Real-time visualization
 ```
 
-**Metrics push interval**: Every 3 seconds  
+**Metrics push interval**: Every 3 seconds
 **Data retention**: Persists until `npm run monitoring:reset`
 
 ### Troubleshooting
 
 **Dashboard shows "No Data"?**
+
 ```bat
 # Check containers are running
 npm run monitoring:status
@@ -1004,6 +1135,7 @@ docker exec k6-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"
 ```
 
 **Containers won't start?**
+
 ```bat
 # Check Docker is running
 docker --version
@@ -1102,6 +1234,7 @@ Learn how to:
 ## Recommended Configurations
 
 ### Smoke test (verify full flow):
+
 ```env
 LOAD_MODE=smoke
 SEND_PROJECT_INVITATIONS=true
@@ -1110,11 +1243,13 @@ NUM_CANDIDATES=10
 LOAD_ITERATIONS_PER_VU=1
 ENFORCE_BOOKING=false
 ```
+
 ```bat
 npm run smoke
 ```
 
 ### 10 concurrent users (verify load flow):
+
 ```env
 NUM_CANDIDATES=10
 LOAD_VUS=10
@@ -1122,11 +1257,13 @@ LOAD_MAX_DURATION=10m
 SEND_PROJECT_INVITATIONS=false
 ENFORCE_BOOKING=false
 ```
+
 ```bat
 npm run load:shared
 ```
 
 ### 150 concurrent users (full load test):
+
 ```env
 NUM_CANDIDATES=150
 LOAD_VUS=150
@@ -1134,10 +1271,10 @@ LOAD_MAX_DURATION=30m
 SEND_PROJECT_INVITATIONS=false
 ENFORCE_BOOKING=false
 ```
+
 ```bat
 npm run load:shared
 ```
-
 
 ---
 
@@ -1146,12 +1283,14 @@ npm run load:shared
 ### Key Implementation Details
 
 **1. Two-Phase Architecture (`scripts/run-shared-project-load.js`)**
+
 - Phase 1 provisions project sequentially (avoids rate limits)
 - Phase 2 runs concurrent load with pre-captured invitation URLs
 - Base64 encoding used to pass large invitation data between phases
 - Automatic cleanup of temporary files
 
 **2. Environment Variable Injection**
+
 - `scripts/run.js` reads `.env` and injects as k6 `-e` flags
 - Oversized values (>4000 chars) written to temp files to avoid Windows ARG_MAX limits
 - All tests use same environment abstraction
@@ -1172,32 +1311,47 @@ npm run load:shared
   `reports/failures-latest.json` for the HTML report's Failed Requests table
 
 **5. Rate Limit Management**
+
 - 65-second gaps between phases (global IP rate limit window)
 - VU start interval: 1.5s (controlled candidate onboarding)
 - Admin operations use shared token across all VUs
 
 **6. Grafana Integration**
+
 - `--grafana` flag adds InfluxDB output to k6 runs
 - 3-second push interval for near-real-time metrics
 - Dashboard auto-provisions via Docker volume mounts
 
 **7. Data Isolation**
+
 - Each test run uses unique timestamp-based IDs
 - Candidates created with `john{N}.load.{timestamp}.{vu}@yopmail.com` pattern
 - Projects tagged for easy identification
 
 **8. Error Handling**
+
 - Graceful degradation on booking API 404 (dev environment)
 - Portal theme 500 errors logged but don't fail test
 - WebSocket failures retry with circuit breaker pattern
 
 ### Performance Characteristics
 
-| Scale | Phase 1 Duration | Phase 2 Duration | Total Time | Memory Usage |
-|-------|------------------|------------------|------------|--------------|
-| 10 VUs | ~60s | ~120s | ~3min | ~200MB |
-| 50 VUs | ~120s | ~180s | ~7min | ~500MB |
-| 150 VUs | ~300s | ~300s | ~12min | ~1GB |
+| Scale   | Phase 1 Duration | Phase 2 Duration | Total Time | Peak Concurrent | Memory Usage |
+| ------- | ---------------- | ---------------- | ---------- | --------------- | ------------ |
+| 10 VUs  | ~60s             | ~120s            | ~3min      | ~10             | ~200MB       |
+| 50 VUs  | ~120s            | ~180s            | ~7min      | ~50             | ~500MB       |
+| 150 VUs | ~300s            | ~300s            | ~12min     | ~64 ⚠️          | ~1GB         |
+
+> **Peak Concurrent ≠ VU count.** VUs are started paced by
+> `LOAD_VU_START_INTERVAL_SECONDS` (1.5s). Because each VU runs ~96s, the number
+> running at the *same instant* saturates at ≈ `96 ÷ 1.5 ≈ 64`. So `NUM_CANDIDATES=150`
+> delivers **150 total users with a ~64-user peak**, ramped over ~225s — not 150
+> simultaneous. **Confirm the actual number from the `PEAK_CONCURRENT_VUS=` line
+> the runner prints at the end of every Phase 2** — the formula is only an
+> estimate, and k6's builtin `vus` metric overstates it (it counts VUs sleeping
+> through their stagger). See the note in [Quick Start](#4-quick-start--which-command-to-use).
+>
+> Phase 3 (cleanup) adds ~10–30s on top of these durations.
 
 ### Security Notes
 

@@ -17,6 +17,8 @@ const https = require('https');
 const path = require('path');
 const { parseFailures, writeFailures } = require('./failure-utils');
 
+const { extractFailedRequest } = require('../utils/failed-request-line');
+
 const ROOT = path.resolve(__dirname, '..');
 const REPORTS_DIR = path.join(ROOT, 'reports');
 const ENV_PATH = path.join(ROOT, '.env');
@@ -224,6 +226,9 @@ async function main() {
     console.log(`[runner] k6 ${printable.join(' ')}`);
   }
 
+  // k6's output is piped instead of inherited so both streams can be teed to
+  // the terminal *and* scanned for [FAILED_REQUEST] lines. The sidecar is what
+  // makes "which request failed, and why" answerable after a run.
   const child = spawn('k6', k6Args, {
     cwd: ROOT,
     // Capture stderr (where k6 console.log emits [FAILED_REQUEST] lines) so we
