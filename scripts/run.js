@@ -233,7 +233,66 @@ async function main() {
     console.error(`[runner] Failed to start k6: ${error.message}`);
     process.exit(2);
   });
-  child.on('exit', (code) => process.exit(code ?? 1));
+  child.on('exit', (code) => {
+    // Generate reports automatically after every test execution — including
+    // failed/threshold-breached runs (non-zero exit) so each run leaves a record.
+    console.log('\n=== Generating CSV reports ===\n');
+      try {
+        const csvReportScript = path.join(ROOT, 'scripts', 'generate-csv-report.js');
+        const csvResult = spawnSync('node', [csvReportScript], {
+          cwd: ROOT,
+          stdio: 'inherit',
+          shell: false
+        });
+        if (csvResult.status === 0) {
+          console.log('\n✓ CSV reports generated successfully');
+        } else {
+          console.warn('\n⚠ CSV report generation failed (non-fatal)');
+        }
+      } catch (err) {
+        console.warn(`⚠ Could not generate CSV reports: ${err.message}`);
+      }
+
+      console.log('\n=== Generating Professional HTML Report ===\n');
+      try {
+        const professionalReportScript = path.join(ROOT, 'scripts', 'generate-professional-report.js');
+        const htmlResult = spawnSync('node', [professionalReportScript], {
+          cwd: ROOT,
+          stdio: 'inherit',
+          shell: false
+        });
+        if (htmlResult.status === 0) {
+          console.log('\n✓ Professional HTML report generated successfully');
+        } else {
+          console.warn('\n⚠ Professional HTML report generation failed (non-fatal)');
+        }
+      } catch (err) {
+        console.warn(`⚠ Could not generate professional HTML report: ${err.message}`);
+      }
+
+      // Export Grafana/InfluxDB data if Grafana output was used
+      const influxUrl = findInfluxOutput(scriptArgs);
+      if (influxUrl) {
+        console.log('\n=== Exporting Grafana/InfluxDB Data ===\n');
+        try {
+          const influxExportScript = path.join(ROOT, 'scripts', 'export-influxdb-data.js');
+          const influxResult = spawnSync('node', [influxExportScript], {
+            cwd: ROOT,
+            stdio: 'inherit',
+            shell: false
+          });
+          if (influxResult.status === 0) {
+            console.log('\n✓ Grafana data exported successfully');
+          } else {
+            console.warn('\n⚠ Grafana data export failed (non-fatal)');
+          }
+        } catch (err) {
+          console.warn(`⚠ Could not export Grafana data: ${err.message}`);
+        }
+      }
+
+    process.exit(code ?? 1);
+  });
 }
 
 main().catch((error) => {

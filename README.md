@@ -290,6 +290,8 @@ npm run monitoring:reset         # Clear all data & restart
 ```bat
 npm run validate                 # Validate .env configuration
 npm run report:csv               # Generate CSV reports from results
+npm run report:professional      # Generate professional HTML report
+npm run report:grafana           # Export InfluxDB/Grafana data to CSV
 ```
 
 ---
@@ -588,18 +590,288 @@ This tells you exactly which endpoint is being rate-limited. The suite retries u
 
 ## 11. Reports
 
-All runs write to `reports/`:
+All runs automatically generate comprehensive reports in `reports/`:
 
-| File | Content |
-|------|---------|
-| `*.html` | Interactive HTML report |
-| `*.json` | Raw k6 metrics |
-| `*-overview.csv` | High-level summary |
-| `*-checks.csv` | Per-check results |
+### Automatic Report Generation
 
-Playwright artifacts: `playwright/artifacts/`
+Every test (smoke, load, grafana) automatically creates **6 CSV files + HTML + JSON**:
 
-All report files are Git-ignored.
+#### Generated Files:
+
+| File Type | Content | Use Case |
+|-----------|---------|----------|
+| **HTML** | Interactive dashboard | Quick visual review in browser |
+| **JSON** | Raw k6 metrics | Programmatic analysis, CI/CD integration |
+| **-overview.csv** | High-level summary | Executive summary, quick metrics |
+| **-summary.csv** | Per-endpoint JMeter-style | Performance comparison, SLA validation |
+| **-aggregate.csv** | With percentiles (P90/P95/P99) | Detailed latency distribution |
+| **-checks.csv** | All assertion results | Test validation, failure analysis |
+| **-url-details.csv** ⭐ | Complete URL list with metrics | **"Which URLs were hit?"** analysis |
+| **-all-metrics.csv** ⭐ | Every k6 metric | Complete test execution data |
+
+### CSV Report Details
+
+**1. overview.csv** - Executive Summary
+```csv
+Metric,Value
+Report Type,Symulate Load Test Report
+Generated At,2026-10-15T12:17:39Z
+Total Requests,171
+Failed Requests,0
+Failed Request %,0
+Total Checks,282
+Checks Passed %,100
+Total Iterations,10
+Total VUs,10
+Avg Response Time (ms),237.01
+P95 Response Time (ms),451.09
+P99 Response Time (ms),620.57
+Total Data Received (bytes),2447360
+Total Data Sent (bytes),10660
+WebSocket Sessions,50
+WS Messages Sent,640
+WS Messages Received,1190
+```
+
+**2. url-details.csv** ⭐ (NEW!)
+```csv
+URL/Endpoint,# Requests,Avg (ms),Median (ms),Min (ms),Max (ms),P90 (ms),P95 (ms),P99 (ms)
+Login - Client Admin,10,315.2,310.5,290.1,355.8,340.2,350.0,355.0
+Get Project Details,10,201.4,198.5,180.2,250.3,230.5,240.1,248.0
+Create Project Candidate 1/10,10,277.0,270.0,240.0,310.0,295.0,305.0,309.0
+...all endpoints listed...
+```
+**Shows exactly which APIs were called and their performance!**
+
+**3. all-metrics.csv** ⭐ (NEW!)
+```csv
+Metric Name,Count,Rate (%),Avg,Min,Median,Max,P90,P95,P99
+http_reqs,171,0,0,0,0,0,0,0,0
+http_req_duration,171,0,237.01,146.7,198.07,1220,351.81,451.09,620.57
+http_req_failed,0,0,0,0,0,0,0,0,0
+ws_sessions,50,0,0,0,0,0,0,0,0
+ws_msgs_sent,640,0,0,0,0,0,0,0,0
+iterations,10,0,96000,79000,97000,113000,109000,111000,113000
+vus_max,10,0,10,10,10,10,10,10,10
+...complete metrics...
+```
+**Every metric k6 captured, in one file!**
+
+### Example: After Running `npm run load:shared`
+
+```
+reports/
+├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html
+├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-overview.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-summary.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-aggregate.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-checks.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-url-details.csv  ⭐
+└── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-all-metrics.csv  ⭐
+```
+
+### Manual CSV Generation
+
+If you need to regenerate CSVs from an existing JSON report:
+
+```bat
+npm run report:csv
+```
+
+This finds the latest JSON report and generates all 6 CSV files.
+
+### Opening Reports
+
+**HTML Report:**
+```bat
+# Open in browser (Windows)
+start reports\shared-admin-candidate-load-*.html
+```
+
+**CSV Reports:**
+```bat
+# Open in Excel
+start reports\symulate-report-*-url-details.csv
+```
+
+**Professional HTML Report:**
+```bat
+# Open comprehensive report in browser (Windows)
+start reports\PROFESSIONAL-*.html
+```
+
+---
+
+## Professional Load Test Reports
+
+Every test automatically generates a **comprehensive, industry-standard HTML report** with:
+
+### 9-Section Report Structure
+
+#### 1. 📊 Executive Summary
+- Test objective and scope
+- Test duration and environment
+- Key performance metrics (requests, throughput, response time)
+- Critical issues count with severity breakdown
+
+#### 2. ⚙️ Test Configuration
+- Environment (staging/prod)
+- Virtual Users (VUs)
+- Test duration
+- Scenario details
+
+#### 3. 📈 Summary Graphs & Charts
+- Response time distribution
+- Data transfer visualization
+- *Note: Charts show test totals; see Grafana for real-time graphs*
+
+#### 4. 🎯 Performance Metrics
+
+**HTTP Metrics:**
+- Total requests
+- Requests/sec rate
+- Response time percentiles (p50, p90, p95, p99)
+- Connection time breakdown (connecting, TLS handshaking, sending, waiting, receiving)
+
+**WebSocket Metrics:**
+- Active sessions
+- Messages sent/received
+- Session duration
+
+**Throughput:**
+- Data received/sent
+- Network efficiency
+
+#### 5. 🔍 Endpoint Analysis
+- Per-URL performance breakdown
+- Request counts per endpoint
+- Response time statistics (avg/median/min/max/p90/p95/p99)
+- *Links to detailed url-details.csv*
+
+#### 6. ⚠️ Detailed Findings
+
+**Automatic Issue Detection** with severity classification:
+
+| Severity | Badge Color | Error Rate | p95 Response Time |
+|----------|-------------|------------|-------------------|
+| 🔴 **Critical** | Red | >5% | >3000ms |
+| 🟠 **High** | Orange | >2% | >2000ms |
+| 🟡 **Medium** | Yellow | >1% | >1000ms |
+| 🟢 **Low** | Green | <1% | <1000ms |
+
+**Each finding includes:**
+- Description of the issue
+- Evidence (actual metrics)
+- Actionable recommendations
+
+**Example Finding:**
+```
+⚠️ HIGH - High Error Rate (3.2%)
+
+Evidence:
+- Error rate: 3.2% (5 failed / 171 total)
+- Threshold: 2%
+
+Recommendations:
+- Investigate server logs for 5xx errors
+- Check database connection pool
+- Review rate limiting configuration
+```
+
+#### 7. ✅ Test Validation
+- Total checks performed
+- Pass/fail counts
+- Pass percentage
+
+#### 8. 📋 Methodology
+- Test approach and objectives
+- Tools used (k6, Grafana, InfluxDB, Playwright)
+- Test phases (provisioning, load execution)
+- Load pattern description
+
+#### 9. 📎 Appendices
+- Links to all 6 CSV reports
+- Raw JSON data reference
+- Test script information
+- Environment variables
+
+### File Naming Convention
+
+```
+PROFESSIONAL-{original-report-name}.html
+```
+
+**Example:**
+```
+reports/
+├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html  (k6 native)
+├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json  (raw data)
+├── PROFESSIONAL-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html  ⭐
+├── symulate-report-...-overview.csv
+├── symulate-report-...-summary.csv
+├── symulate-report-...-aggregate.csv
+├── symulate-report-...-checks.csv
+├── symulate-report-...-url-details.csv
+└── symulate-report-...-all-metrics.csv
+```
+
+### Auto-Generation
+
+Professional reports are **automatically generated** after every test run:
+
+```bat
+npm run load:shared          # ✓ Auto-generates professional report
+npm run smoke:grafana        # ✓ Auto-generates professional report
+npm run load:shared:grafana  # ✓ Auto-generates professional report
+```
+
+### Manual Generation
+
+Regenerate professional report from latest JSON:
+
+```bat
+npm run report:professional
+```
+
+### Report Features
+
+**Responsive Design:**
+- Mobile-friendly layout
+- Print-optimized CSS
+- Collapsible sections
+
+**Color-Coded Severity:**
+- Critical: Red (#dc3545)
+- High: Orange (#fd7e14)
+- Medium: Yellow (#ffc107)
+- Low: Green (#28a745)
+
+**Executive-Ready:**
+- Non-technical executive summary
+- Visual metric presentation
+- Clear actionable findings
+- Professional formatting
+
+### Use Cases
+
+1. **Stakeholder Reports** - Share with management/clients
+2. **Performance Baseline** - Document performance benchmarks
+3. **Regression Testing** - Compare against previous runs
+4. **Capacity Planning** - Evidence for infrastructure decisions
+5. **Post-Mortem Analysis** - Detailed incident investigation
+
+### Playwright Artifacts
+
+Browser automation artifacts stored separately:
+```
+playwright/artifacts/
+├── screenshots/
+├── videos/
+└── traces/
+```
+
+All report files are Git-ignored for security and size.
 
 ---
 
@@ -690,6 +962,70 @@ npm run monitoring:up
 ```
 
 For complete Grafana setup guide, see: **[monitoring/GRAFANA_SETUP.md](monitoring/GRAFANA_SETUP.md)**
+
+### Exporting Grafana Data
+
+**Automatic Export** (when using Grafana):
+```bash
+npm run load:shared:grafana    # ✅ Auto-exports InfluxDB data after test
+npm run smoke:grafana           # ✅ Auto-exports InfluxDB data after test
+```
+
+**Manual Export:**
+```bash
+npm run report:grafana
+```
+
+**What Gets Exported:**
+
+1. **grafana-http-requests-*.csv** ⭐
+   - Every HTTP request with **actual full URLs**
+   - Time, URL, Response Time, Status, Method
+   - Complete request-level detail
+
+2. **grafana-metrics-summary-*.csv**
+   - Aggregated metrics (count, mean, min, max, sum)
+   - All HTTP, WebSocket, VU, and iteration metrics
+
+3. **grafana-vus-timeseries-*.csv**
+   - Virtual Users over time (load pattern)
+   - Time-series data for trend analysis
+
+4. **grafana-errors-*.csv**
+   - Failed requests with URLs and timestamps
+   - Empty file = 100% success rate ✅
+
+**Example HTTP Requests CSV:**
+```csv
+time,value,url,name,method,status
+2026-10-15T13:45:01Z,245.3,https://superadmin.symulate-dev.weuno.co/organizations,Create Client,POST,200
+2026-10-15T13:45:02Z,189.7,https://clientadmin.symulate-dev.weuno.co/projects,Create Project,POST,200
+2026-10-15T13:45:03Z,312.5,https://api.symulate-dev.weuno.co/tasks,Create Task,POST,200
+```
+
+**Requirements:**
+- ✅ Monitoring stack must be running (`npm run monitoring:up`)
+- ✅ Test must use `--grafana` flag or `:grafana` npm script
+- ✅ InfluxDB must contain data (test must complete successfully)
+
+**Benefits:**
+- 📊 Actual URLs captured (not just labels)
+- ⏱️ Time-series data for trend analysis
+- 🔍 Request-level granularity
+- 📈 Compatible with Excel pivot tables
+- 🎯 Same data Grafana visualizes
+
+**📊 Excel Analysis Guide:**
+
+For detailed Excel Pivot Table tutorials and data analysis techniques, see:
+**[docs/EXCEL_ANALYSIS_GUIDE.md](docs/EXCEL_ANALYSIS_GUIDE.md)**
+
+Learn how to:
+- Create URLs by Response Time analysis
+- Track Errors by Time Period
+- Visualize Load Patterns
+- Analyze Performance Trends
+- Build automated dashboards
 
 ---
 

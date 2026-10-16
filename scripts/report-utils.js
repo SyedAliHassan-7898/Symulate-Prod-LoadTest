@@ -2,11 +2,55 @@ const fs = require('fs');
 const path = require('path');
 
 const reportsDir = path.resolve(__dirname, '..', 'reports');
+const envFilePath = path.resolve(__dirname, '..', '.env');
+
+// Minimal .env reader (no dependency). Returns {} when the file is absent.
+function readProjectEnv() {
+  const env = {};
+  if (!fs.existsSync(envFilePath)) return env;
+  fs.readFileSync(envFilePath, 'utf8').split(/\r?\n/).forEach((rawLine) => {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) return;
+    const eq = line.indexOf('=');
+    if (eq < 1) return;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    env[key] = value;
+  });
+  return env;
+}
+
+// Resolve a config value: explicit process env wins, then .env file, then fallback.
+function resolveConfig(key, fallback = '') {
+  const fromProcess = process.env[key];
+  if (fromProcess != null && String(fromProcess).trim() !== '') return fromProcess;
+  const fromFile = readProjectEnv()[key];
+  if (fromFile != null && String(fromFile).trim() !== '') return fromFile;
+  return fallback;
+}
 
 function latestJsonReport() {
+  // Explicit override: allow the runner to point at a specific JSON report
+  // (e.g. Phase 2 of the shared-project load) via SOURCE_REPORT_JSON.
+  const explicit = process.env.SOURCE_REPORT_JSON;
+  if (explicit) {
+    const explicitPath = path.isAbsolute(explicit) ? explicit : path.join(reportsDir, explicit);
+    if (fs.existsSync(explicitPath)) {
+      return { name: path.basename(explicitPath), fullPath: explicitPath, mtimeMs: fs.statSync(explicitPath).mtimeMs };
+    }
+  }
+
+  // Pick the newest k6 JSON report. Include every *.json (not just the
+  // `report-` prefix) so multi-phase runs surface the latest phase — e.g. the
+  // shared-project loader's Phase 2 report is `shared-admin-candidate-load-...`
+  // which the old `^report-` filter silently dropped, causing setup/smoke data
+  // to be reported instead of the real load run.
   const reports = fs
     .readdirSync(reportsDir)
-    .filter((name) => /^report-.*\.json$/i.test(name))
+    .filter((name) => /\.json$/i.test(name))
     .map((name) => {
       const fullPath = path.join(reportsDir, name);
       return { name, fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs };
@@ -112,5 +156,7 @@ module.exports = {
   metricValue,
   requestRows,
   checkRows,
-  round
+  round,
+  readProjectEnv,
+  resolveConfig
 };
