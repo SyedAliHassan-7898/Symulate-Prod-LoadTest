@@ -31,7 +31,11 @@ symulate-load-tests/
 │   ├── run.js                          # Generic k6 runner with .env integration
 │   ├── run-shared-project-load.js      # 2-phase shared-project orchestrator
 │   ├── e2e-no-anum-full.js             # Playwright + k6 E2E automation
-│   ├── generate-csv-report.js          # Report generator
+│   ├── generate-csv-report.js          # 6-file CSV report generator
+│   ├── generate-professional-report.js # Professional HTML report
+│   ├── export-influxdb-data.js         # InfluxDB → CSV (JMeter summary + URLs)
+│   ├── report-utils.js                 # Shared report/naming helpers
+│   ├── failure-utils.js                # Per-request failure capture
 │   └── validate-project.js             # Environment validator
 │
 ├── 📁 scenarios/          # Reusable k6 scenario modules
@@ -42,10 +46,11 @@ symulate-load-tests/
 │   └── projectcreation.js              # Project lifecycle
 │
 ├── 📁 utils/              # Shared utilities & helpers
-│   ├── common.js                       # Shared logic across tests
-│   ├── http-client.js                  # HTTP wrapper with retries
-│   ├── websocket-client.js             # WebSocket handling
-│   └── ...more utilities
+│   ├── http.js                         # HTTP wrapper: retries, tags, failure capture
+│   ├── helpers.js                      # Shared logic (report naming, IDs)
+│   ├── routes.js                       # API route builders
+│   ├── socketConversation.js           # WebSocket conversation flow
+│   └── ...more utilities (data, cleanup, local-report, run-logger, webmAudio)
 │
 ├── 📁 data/               # Test data & fixtures
 │   ├── candidates.csv                  # Pre-defined candidate pool
@@ -232,6 +237,7 @@ ANUM_API_ENABLED=false
 | `LOAD_ITERATIONS_PER_VU` | `10` | 10 VUs × 10 iterations = 100 orgs in 1 run | `1` |
 | `SEND_PROJECT_INVITATIONS` | `false` | Project stays DRAFT, candidates can't access | `true` |
 | `CANDIDATE_EXECUTION_SOURCE` | empty or `none` | Activities never run | `generated` |
+| `ANUM_API_ENABLED` / `ANAM_MODE` | `enable` / `enabled` / `yes` / `1` | Parsed as **false** silently (code checks `=== 'true'`) | `true` or `false` |
 
 ---
 
@@ -586,6 +592,17 @@ All HTTP calls now log:
 
 This tells you exactly which endpoint is being rate-limited. The suite retries up to 3 times with backoff.
 
+### `href token not found ... expected access_token in the email login href` (prod / UAT)
+
+**Cause:** The harness does **not** read the candidate's inbox. It gets the candidate login link from the `accessMyPortal` field that the **invitation API returns** (`scenarios/projectcreation.js` → `allInvitationHrefs`). The backend only populates that field when `EXPOSE_CANDIDATE_PORTAL_LINKS=true` — a local/dev-only opt-in. For `NODE_ENV=dev` the links are included automatically, but **UAT/prod intentionally omit them** (returning candidate bearer tokens in an API response is a security risk).
+
+So pointing `API_URL` at `https://api.symulate.ai/prod/api` makes the invitation response come back **without** candidate portal links → no `access_token` → `candidateSessionFromInviteHref()` returns null → the candidate flow logs the message and returns zero activities. This is **expected in prod**, not a script bug.
+
+**Fix options:**
+- Run the candidate-assessment / `load:shared` flow against the **dev** backend (where links are exposed) — this is what the suite is designed for.
+- If you must load-test prod, ask the backend team to enable `EXPOSE_CANDIDATE_PORTAL_LINKS=true` on the prod env **temporarily** (explicit security trade-off), restart it, then rerun Phase 1. Do **not** leave it on in prod.
+- The harness prints this exact hint in shared-load mode when no href is captured, and aborts before Phase 2 rather than running a meaningless load.
+
 ---
 
 ## 11. Reports
@@ -608,6 +625,44 @@ Every test (smoke, load, grafana) automatically creates **6 CSV files + HTML + J
 | **-checks.csv** | All assertion results | Test validation, failure analysis |
 | **-url-details.csv** ⭐ | Complete URL list with metrics | **"Which URLs were hit?"** analysis |
 | **-all-metrics.csv** ⭐ | Every k6 metric | Complete test execution data |
+| **failures-latest.json** | Per-request failures (code + message) | Feeds HTML *Failed Requests* table |
+| **jmeter-endpoint-summary-*.csv** | JMeter-style per-endpoint (from InfluxDB) | SLA / capacity analysis |
+
+### Report Naming Convention
+
+All reports use a consistent **`symulate`** prefix (the separate "happening" project uses its own naming — never mix the two). The base name is built by `reportName()` in `utils/helpers.js`:
+
+```
+<prefix>-<LOAD_MODE>-<SCENARIO>[-<anam-tag>]-<timestamp>
+```
+
+- **Prefix is always `symulate...`** — e.g. `symulate-smoke-full`, `symulate-shared-admin-candidate-load`.
+- **Anam tag** (`-with-anam` / `-without-anam`) is added **only** for Anam-outage runs: `SCENARIO=situation-only`, or the anam/anum commands (`smoke:no-anum:setup`, `smoke:no-anum:perform`, `smoke:no-anum:session-audit`). **Normal runs carry no tag.**
+
+Derived filenames always start from a clean base (`report-utils.js` strips legacy `symulate-`/`symulate-report-`/`PROFESSIONAL-`/`report-` prefixes):
+
+| Output | Pattern |
+|--------|---------|
+| k6 native HTML/JSON | `symulate-<base>.json` (written by the test) |
+| Professional HTML | `symulate-<base>.html` |
+| 6-file CSV set | `symulate-report-<base>-{overview,summary,aggregate,checks,url-details,all-metrics}.csv` |
+| JMeter endpoint summary (InfluxDB) | `jmeter-endpoint-summary-<ts>.csv` |
+| Full-URL detail (InfluxDB) | `url-details-<ts>.csv` |
+| Failure sidecar | `failures-latest.json` |
+
+### Failed Request Capture (status code + message)
+
+k6's summary only reports the **aggregated** failure rate — never *which* request failed or *why*. This suite captures every failed request at the source:
+
+1. **`utils/http.js`** — each wrapper routes through `finish()`, which for any response with **status ≥ 400** or a **network error** emits one structured line:
+   ```
+   [FAILED_REQUEST] {"name":"Login - Load Test Admin","method":"POST","url":"https://api.../auth/login","status":429,"errorCode":1429,"message":"Too many login attempts...","at":"2026-10-16T07:36:47Z"}
+   ```
+   The `message` is pulled from the JSON body's `message`/`error` field (else the raw body, else the network error text).
+2. **`scripts/failure-utils.js`** — both runners (`run.js` and `run-shared-project-load.js`) tee k6's stderr, parse these lines, and write `reports/failures-latest.json` on **every** run (an empty array clears stale failures).
+3. The **professional HTML report** renders them under *Detailed Findings → Failed Requests* as a table: Time · Label · Method · Status (color-coded 4xx/5xx) · Failure Message · URL.
+
+> `failures-latest.json` is a sidecar, not a k6 report — the report picker (`latestJsonReport()`) explicitly excludes it so it's never mistaken for test data.
 
 ### CSV Report Details
 
@@ -661,14 +716,15 @@ vus_max,10,0,10,10,10,10,10,10,10
 
 ```
 reports/
-├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html
-├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json
+├── symulate-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json   (raw k6 data)
+├── symulate-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html   (professional ⭐)
 ├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-overview.csv
 ├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-summary.csv
 ├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-aggregate.csv
 ├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-checks.csv
 ├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-url-details.csv  ⭐
-└── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-all-metrics.csv  ⭐
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-all-metrics.csv  ⭐
+└── failures-latest.json   (per-request failures → HTML Failed Requests table)
 ```
 
 ### Manual CSV Generation
@@ -698,7 +754,7 @@ start reports\symulate-report-*-url-details.csv
 **Professional HTML Report:**
 ```bat
 # Open comprehensive report in browser (Windows)
-start reports\PROFESSIONAL-*.html
+start reports\symulate-*.html
 ```
 
 ---
@@ -799,15 +855,14 @@ Recommendations:
 ### File Naming Convention
 
 ```
-PROFESSIONAL-{original-report-name}.html
+symulate-{original-report-name}.html
 ```
 
 **Example:**
 ```
 reports/
-├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html  (k6 native)
-├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json  (raw data)
-├── PROFESSIONAL-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html  ⭐
+├── symulate-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json  (raw k6 data)
+├── symulate-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html  ⭐ (professional)
 ├── symulate-report-...-overview.csv
 ├── symulate-report-...-summary.csv
 ├── symulate-report-...-aggregate.csv
@@ -893,7 +948,7 @@ npm run smoke:grafana
 # Step 3: Open dashboard
 ```
 
-Access live dashboard: **http://localhost:3000** (admin/admin)
+Access live dashboard: **http://localhost:3001** (admin/admin)
 
 ### Available Grafana Commands
 
@@ -928,7 +983,7 @@ k6 Test Run
      ↓
 InfluxDB (port 8087)
      ↓
-Grafana Dashboard (port 3000)
+Grafana Dashboard (port 3001)
      ↓
 Real-time visualization
 ```
@@ -944,8 +999,8 @@ Real-time visualization
 npm run monitoring:status
 
 # Verify InfluxDB has data
-docker exec symulate-influxdb influx -execute "SHOW DATABASES"
-docker exec symulate-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"
+docker exec k6-influxdb influx -execute "SHOW DATABASES"
+docker exec k6-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"
 ```
 
 **Containers won't start?**
@@ -954,7 +1009,7 @@ docker exec symulate-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"
 docker --version
 
 # Check ports are free
-netstat -an | findstr "3000 8087"
+netstat -an | findstr "3001 8087"
 
 # Reset everything
 npm run monitoring:reset
@@ -994,6 +1049,21 @@ npm run report:grafana
 4. **grafana-errors-*.csv**
    - Failed requests with URLs and timestamps
    - Empty file = 100% success rate ✅
+
+5. **jmeter-endpoint-summary-*.csv** ⭐
+   - JMeter-style per-endpoint table:
+     `Label, # Samples, Average, Min, Max, Std. Dev., Error %, Throughput, Received KB/sec, Sent KB/sec, Avg. Bytes`
+   - Includes a **TOTAL** row aggregated across all endpoints
+
+6. **url-details-*.csv** ⭐
+   - Full request URL per label (method / status / URL), built from InfluxDB
+     `http_req_duration{name=...}` plus the `recv_bytes`/`sent_bytes` counters
+
+> **Run-window scoping:** InfluxDB accumulates metrics across *all* runs forever.
+> The runner stamps each run's start time and passes it to the exporter as
+> `INFLUX_SINCE_MS`, so every query is scoped to **the current run only** —
+> without it, aggregates would silently span days of prior runs. Note also that
+> `name` is a reserved InfluxQL word and is always quoted (`"name"`) in queries.
 
 **Example HTTP Requests CSV:**
 ```csv
@@ -1086,16 +1156,20 @@ npm run load:shared
 - Oversized values (>4000 chars) written to temp files to avoid Windows ARG_MAX limits
 - All tests use same environment abstraction
 
-**3. WebSocket Handling (`utils/websocket-client.js`)**
+**3. WebSocket Handling (`utils/socketConversation.js`)**
 - Simulates real AI conversation flow
 - Staggered connection timing (prevents thundering herd)
 - Automatic reconnection with exponential backoff
 - Conversation state management per VU
 
-**4. Retry Logic (`utils/http-client.js`)**
+**4. HTTP Wrapper (`utils/http.js`)**
 - 429 rate limits: 3 retries with exponential backoff
 - Detailed logging shows which endpoint is rate-limited
 - Configurable via `HTTP_429_MAX_RETRIES` in .env
+- Tags every request with `name` **and full `url`** (stored in InfluxDB for URL-level reports)
+- Emits a structured `[FAILED_REQUEST] {json}` line per failed request
+  (status code + response-body message), which the runner scrapes into
+  `reports/failures-latest.json` for the HTML report's Failed Requests table
 
 **5. Rate Limit Management**
 - 65-second gaps between phases (global IP rate limit window)
@@ -1142,12 +1216,3 @@ npm run load:shared
 
 ---
 
-## 📞 Support & Contribution
-
-For issues or questions:
-1. Check [Common Mistakes & Fixes](#10-common-mistakes--fixes)
-2. Review [monitoring/GRAFANA_SETUP.md](monitoring/GRAFANA_SETUP.md) for Grafana issues
-3. Run `npm run validate` to check environment setup
-
-**Project maintained by**: Symulate AI Engineering Team  
-**Last updated**: January 2025
