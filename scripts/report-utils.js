@@ -48,9 +48,12 @@ function latestJsonReport() {
   // shared-project loader's Phase 2 report is `shared-admin-candidate-load-...`
   // which the old `^report-` filter silently dropped, causing setup/smoke data
   // to be reported instead of the real load run.
+  //
+  // Exclude the runner's failures sidecar (failures-latest.json) so it is never
+  // mistaken for a k6 summary report.
   const reports = fs
     .readdirSync(reportsDir)
-    .filter((name) => /\.json$/i.test(name))
+    .filter((name) => /\.json$/i.test(name) && !/^failures-latest\.json$/i.test(name))
     .map((name) => {
       const fullPath = path.join(reportsDir, name);
       return { name, fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs };
@@ -68,6 +71,27 @@ function round(value, digits = 2) {
   if (!Number.isFinite(value)) return 0;
   const factor = 10 ** digits;
   return Math.round(value * factor) / factor;
+}
+
+// Strip any report-naming prefixes (symulate-report- / symulate- / PROFESSIONAL- /
+// report-) plus the .json extension, leaving the bare test base name. Used so
+// derived filenames (CSV / HTML) always start from a clean, predictable base
+// regardless of how the source JSON was named.
+function stripReportPrefixes(name) {
+  return String(name || '')
+    .replace(/\.json$/i, '')
+    .replace(/^(symulate-report|symulate|PROFESSIONAL|report)-/i, '');
+}
+
+// Canonical CSV base: README convention is symulate-report-<base>.
+function csvBaseNameFrom(sourceName) {
+  return `symulate-report-${stripReportPrefixes(sourceName)}`;
+}
+
+// Canonical professional-HTML base: user chose a bare symulate- prefix
+// (no PROFESSIONAL- marker).
+function htmlBaseNameFrom(sourceName) {
+  return `symulate-${stripReportPrefixes(sourceName)}`;
 }
 
 function metricValue(metric, key, fallback = 0) {
@@ -158,5 +182,8 @@ module.exports = {
   checkRows,
   round,
   readProjectEnv,
-  resolveConfig
+  resolveConfig,
+  stripReportPrefixes,
+  csvBaseNameFrom,
+  htmlBaseNameFrom
 };

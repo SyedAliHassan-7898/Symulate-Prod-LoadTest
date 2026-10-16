@@ -19,9 +19,14 @@
 const { spawnSync } = require('child_process');
 const fs   = require('fs');
 const path = require('path');
+const { parseFailures, writeFailures } = require('./failure-utils');
 
 const ROOT    = path.resolve(__dirname, '..');
 const ENVFILE = path.join(ROOT, '.env');
+
+// Failures captured across all k6 phases in this run (from [FAILED_REQUEST]
+// lines emitted by utils/http.js), persisted for the HTML report.
+const ALL_FAILURES = [];
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -86,6 +91,9 @@ function k6(script, env, extraArgs = []) {
   const output = `${result.stdout || ''}${result.stderr || ''}`;
   process.stdout.write(redactSessionSecrets(output));
   if (result.error) console.error(`k6 spawn error: ${result.error.message}`);
+  // Capture per-request failures (status + message) for the HTML report.
+  const failures = parseFailures(output);
+  if (failures.length) ALL_FAILURES.push(...failures);
   return { code: result.status == null ? 1 : result.status, out: output };
 }
 
@@ -165,6 +173,10 @@ async function main() {
     console.log(`  GRAFANA        = ENABLED (live monitoring)`);
   }
   console.log('============================================================\n');
+
+  // Stamp the run start so the InfluxDB exporter can scope its aggregates to
+  // THIS run only (InfluxDB otherwise accumulates every run forever).
+  const RUN_START_MS = Date.now();
 
   // ── PHASE 1: provision one project with all candidates ─────────────────────
   console.log('=== Phase 1/2 — k6: provision shared project + candidates ===\n');
@@ -293,6 +305,14 @@ async function main() {
   // Cleanup temp file
   try { fs.unlinkSync(hrefsTmpPath); } catch (_) {}
 
+  // Persist captured per-request failures so the HTML report can render them.
+  try {
+    const failuresPath = writeFailures(ALL_FAILURES);
+    console.log(`\n✓ Captured ${ALL_FAILURES.length} failed request(s) → ${path.basename(failuresPath)}`);
+  } catch (err) {
+    console.warn(`⚠ Could not write failures file: ${err.message}`);
+  }
+
   // Generate CSV reports automatically
   console.log('\n=== Generating CSV reports ===\n');
   try {
@@ -337,7 +357,8 @@ async function main() {
       const influxResult = spawnSync('node', [influxExportScript], {
         cwd: ROOT,
         stdio: 'inherit',
-        shell: false
+        shell: false,
+        env: { ...process.env, INFLUX_SINCE_MS: String(RUN_START_MS) }
       });
       if (influxResult.status === 0) {
         console.log('\n✓ Grafana data exported successfully');

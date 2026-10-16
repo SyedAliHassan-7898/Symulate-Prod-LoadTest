@@ -15,6 +15,7 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const path = require('path');
+const { parseFailures, writeFailures } = require('./failure-utils');
 
 const ROOT = path.resolve(__dirname, '..');
 const REPORTS_DIR = path.join(ROOT, 'reports');
@@ -225,8 +226,21 @@ async function main() {
 
   const child = spawn('k6', k6Args, {
     cwd: ROOT,
-    stdio: 'inherit',
+    // Capture stderr (where k6 console.log emits [FAILED_REQUEST] lines) so we
+    // can build reports/failures-latest.json, while still streaming it live.
+    stdio: ['inherit', 'inherit', 'pipe'],
     shell: false
+  });
+
+  // Stamp run start so the InfluxDB exporter scopes aggregates to THIS run.
+  const RUN_START_MS = Date.now();
+
+  // Collect raw stderr to parse per-request failures after the run.
+  let stderrBuf = '';
+  child.stderr.setEncoding('utf-8');
+  child.stderr.on('data', (chunk) => {
+    process.stderr.write(chunk); // tee — keep live output
+    stderrBuf += chunk;
   });
 
   child.on('error', (error) => {
@@ -234,6 +248,15 @@ async function main() {
     process.exit(2);
   });
   child.on('exit', (code) => {
+    // Persist per-request failures (status + message) for the HTML report.
+    try {
+      const failures = parseFailures(stderrBuf);
+      const failuresPath = writeFailures(failures);
+      console.log(`\n✓ Captured ${failures.length} failed request(s) → ${path.basename(failuresPath)}`);
+    } catch (err) {
+      console.warn(`⚠ Could not write failures file: ${err.message}`);
+    }
+
     // Generate reports automatically after every test execution — including
     // failed/threshold-breached runs (non-zero exit) so each run leaves a record.
     console.log('\n=== Generating CSV reports ===\n');
@@ -279,7 +302,8 @@ async function main() {
           const influxResult = spawnSync('node', [influxExportScript], {
             cwd: ROOT,
             stdio: 'inherit',
-            shell: false
+            shell: false,
+            env: { ...process.env, INFLUX_SINCE_MS: String(RUN_START_MS) }
           });
           if (influxResult.status === 0) {
             console.log('\n✓ Grafana data exported successfully');
