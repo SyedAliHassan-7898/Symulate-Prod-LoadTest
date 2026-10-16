@@ -16,6 +16,8 @@ const http = require('http');
 const https = require('https');
 const path = require('path');
 
+const { extractFailedRequest } = require('../utils/failed-request-line');
+
 const ROOT = path.resolve(__dirname, '..');
 const REPORTS_DIR = path.join(ROOT, 'reports');
 const ENV_PATH = path.join(ROOT, '.env');
@@ -223,17 +225,79 @@ async function main() {
     console.log(`[runner] k6 ${printable.join(' ')}`);
   }
 
+  // k6's output is piped instead of inherited so both streams can be teed to
+  // the terminal *and* scanned for [FAILED_REQUEST] lines. The sidecar is what
+  // makes "which request failed, and why" answerable after a run.
   const child = spawn('k6', k6Args, {
     cwd: ROOT,
-    stdio: 'inherit',
+    stdio: ['inherit', 'pipe', 'pipe'],
     shell: false
   });
+
+  const failures = [];
+  let pending = '';
+  const ingest = (chunk, stream) => {
+    const text = chunk.toString();
+    stream.write(text);
+    pending += text;
+    let newline = pending.indexOf('\n');
+    while (newline >= 0) {
+      const line = pending.slice(0, newline);
+      pending = pending.slice(newline + 1);
+      const record = parseFailedRequestLine(line);
+      if (record) failures.push(record);
+      newline = pending.indexOf('\n');
+    }
+  };
 
   child.on('error', (error) => {
     console.error(`[runner] Failed to start k6: ${error.message}`);
     process.exit(2);
   });
-  child.on('exit', (code) => process.exit(code ?? 1));
+  if (child.stdout) child.stdout.on('data', (chunk) => ingest(chunk, process.stdout));
+  if (child.stderr) child.stderr.on('data', (chunk) => ingest(chunk, process.stderr));
+
+  // 'close' (not 'exit') so the whole output has been parsed before the
+  // sidecar is written and the process exits.
+  child.on('close', (code) => {
+    const tail = parseFailedRequestLine(pending);
+    if (tail) failures.push(tail);
+    writeFailuresSidecar(failures);
+    process.exit(mapK6ExitCode(code));
+  });
+}
+
+function parseFailedRequestLine(line) {
+  // k6 v1/v2 wraps console output as `time=... level=info msg="[FAILED_REQUEST] {...}"`;
+  // the util accepts both that envelope and the bare line.
+  return extractFailedRequest(line);
+}
+
+// reports/failures-latest.json — always rewritten, so an empty array clears
+// stale failures from a previous run.
+function writeFailuresSidecar(failures) {
+  try {
+    fs.writeFileSync(
+      path.join(REPORTS_DIR, 'failures-latest.json'),
+      `${JSON.stringify(failures, null, 2)}\n`,
+      'utf8'
+    );
+    if (failures.length) {
+      console.log(`[runner] ${failures.length} failed request(s) recorded in reports/failures-latest.json`);
+    }
+  } catch (error) {
+    console.error(`[runner] Could not write reports/failures-latest.json: ${error.message}`);
+  }
+}
+
+// k6 exits with 99 when thresholds are breached (and with other codes for
+// internal errors). Pipelines gate on 1 = "test failed", so 99 is normalised
+// here — otherwise a threshold breach would surface as an undocumented 99 and
+// the documented 0/1/2 table would be wrong.
+function mapK6ExitCode(code) {
+  if (code === null || code === undefined) return 1;
+  if (code === 99) return 1;
+  return code;
 }
 
 main().catch((error) => {

@@ -31,7 +31,11 @@ symulate-load-tests/
 │   ├── run.js                          # Generic k6 runner with .env integration
 │   ├── run-shared-project-load.js      # 2-phase shared-project orchestrator
 │   ├── e2e-no-anum-full.js             # Playwright + k6 E2E automation
-│   ├── generate-csv-report.js          # Report generator
+│   ├── generate-csv-report.js          # 6-file CSV report generator
+│   ├── generate-professional-report.js # Professional HTML report
+│   ├── export-influxdb-data.js         # InfluxDB → CSV (JMeter summary + URLs)
+│   ├── report-utils.js                 # Shared report/naming helpers
+│   ├── failure-utils.js                # Per-request failure capture
 │   └── validate-project.js             # Environment validator
 │
 ├── 📁 scenarios/          # Reusable k6 scenario modules
@@ -42,10 +46,11 @@ symulate-load-tests/
 │   └── projectcreation.js              # Project lifecycle
 │
 ├── 📁 utils/              # Shared utilities & helpers
-│   ├── common.js                       # Shared logic across tests
-│   ├── http-client.js                  # HTTP wrapper with retries
-│   ├── websocket-client.js             # WebSocket handling
-│   └── ...more utilities
+│   ├── http.js                         # HTTP wrapper: retries, tags, failure capture
+│   ├── helpers.js                      # Shared logic (report naming, IDs)
+│   ├── routes.js                       # API route builders
+│   ├── socketConversation.js           # WebSocket conversation flow
+│   └── ...more utilities (data, cleanup, local-report, run-logger, webmAudio)
 │
 ├── 📁 data/               # Test data & fixtures
 │   ├── candidates.csv                  # Pre-defined candidate pool
@@ -162,13 +167,13 @@ symulate-load-tests/
 
 ## 1. Prerequisites
 
-| Tool | Purpose |
-|------|---------|
-| Node.js 20+ | Runner scripts |
-| npm | Package management |
-| k6 | Load test execution |
+| Tool           | Purpose                     |
+| -------------- | --------------------------- |
+| Node.js 20+    | Runner scripts              |
+| npm            | Package management          |
+| k6             | Load test execution         |
 | Docker Desktop | Grafana/InfluxDB (optional) |
-| Chromium | Playwright browser tests |
+| Chromium       | Playwright browser tests    |
 
 ```bat
 node --version
@@ -182,7 +187,33 @@ k6 version
 
 ```bat
 npm install
+K6 Installation Windows
+If you use the Chocolatey package manager you can install the unofficial k6 package with:
+
+choco install k6
+If you use the Windows Package Manager, install the official packages from the k6 manifests (created by the community):
+
+winget install k6 --source winget
+Alternatively, you can download and run the latest official installer.
+
+Docker
+Bash
+
+docker pull grafana/k6
+We also have a separate image you can use with chromium installed to run k6 browser tests.
+
+Bash
+
+docker pull grafana/k6:master-with-browser
+
+
+Verify the Installation
+
+Open a new terminal or command prompt window and check the installed version:
+bash
+k6 version
 copy .env.example .env
+winget install k6 --source winget
 ```
 
 Fill `.env` with real credentials. Never commit `.env` — it is Git-ignored.
@@ -226,12 +257,13 @@ ANUM_API_ENABLED=false
 
 ### ⚠️ Critical settings that cause confusion:
 
-| Setting | Wrong value | What happens | Correct value |
-|---------|-------------|-------------|---------------|
-| `LOAD_MODE` | `load` when running smoke | Creates `LOAD_VUS × LOAD_ITERATIONS_PER_VU` orgs | `smoke` |
-| `LOAD_ITERATIONS_PER_VU` | `10` | 10 VUs × 10 iterations = 100 orgs in 1 run | `1` |
-| `SEND_PROJECT_INVITATIONS` | `false` | Project stays DRAFT, candidates can't access | `true` |
-| `CANDIDATE_EXECUTION_SOURCE` | empty or `none` | Activities never run | `generated` |
+| Setting                          | Wrong value                        | What happens                                           | Correct value     |
+| -------------------------------- | ---------------------------------- | ------------------------------------------------------ | ----------------- |
+| `LOAD_MODE`                      | `load` when running smoke          | Creates`LOAD_VUS × LOAD_ITERATIONS_PER_VU` orgs        | `smoke`           |
+| `LOAD_ITERATIONS_PER_VU`         | `10`                               | 10 VUs × 10 iterations = 100 orgs in 1 run             | `1`               |
+| `SEND_PROJECT_INVITATIONS`       | `false`                            | Project stays DRAFT, candidates can't access           | `true`            |
+| `CANDIDATE_EXECUTION_SOURCE`     | empty or`none`                     | Activities never run                                   | `generated`       |
+| `ANUM_API_ENABLED` / `ANAM_MODE` | `enable` / `enabled` / `yes` / `1` | Parsed as**false** silently (code checks `=== 'true'`) | `true` or `false` |
 
 ---
 
@@ -239,29 +271,63 @@ ANUM_API_ENABLED=false
 
 ### 🎯 Common Test Scenarios
 
-| Your Goal | Command | Duration | What It Does |
-|-----------|---------|----------|--------------|
-| **Quick validation** | `npm run smoke` | 30s | 1 user completes full flow |
-| **10 concurrent users** | `npm run load:shared` | 3min | 10 users on same project |
-| **50 concurrent users** | `npm run load:shared` | 4min | Configure NUM_CANDIDATES=50 in .env |
-| **150 concurrent users** | `npm run load:shared` | 7min | Configure NUM_CANDIDATES=150 in .env |
-| **Live monitoring** | `npm run load:shared:grafana` | 3min | With real-time Grafana dashboard |
-| **Isolated projects** | `npm run load` | 5min | Each VU creates own project |
-| **AI outage test** | `npm run e2e:anam:outage503` | 10min | Validates resilience during AI downtime |
+| Your Goal                | Command                       | Duration | What It Does                            |
+| ------------------------ | ----------------------------- | -------- | --------------------------------------- |
+| **Quick validation**     | `npm run smoke`               | ~30s     | 1 user completes full flow              |
+| **10 users (concurrent)**| `npm run load:shared`         | ~3min    | 10 users on same project (~10 peak)     |
+| **50 users (ramped)**    | `npm run load:shared`         | ~7min    | NUM_CANDIDATES=50 (~50 peak concurrent) |
+| **150 users (ramped)**   | `npm run load:shared`         | ~12min   | NUM_CANDIDATES=150 (~64 peak — see note)|
+| **Live monitoring**      | `npm run load:shared:grafana` | ~3min    | With real-time Grafana dashboard        |
+| **Isolated projects**    | `npm run load`                | ~5min    | Each VU creates own project             |
+| **AI outage test**       | `npm run e2e:anam:outage503`  | ~10min   | Validates resilience during AI downtime |
+
+> **⚠️ "Concurrent users" vs. total users — read before quoting numbers.**
+> `load:shared` provisions `NUM_CANDIDATES` users and starts them **paced** by
+> `LOAD_VU_START_INTERVAL_SECONDS` (default **1.5s**), not all at once. This
+> variable is read **by the test itself** (it used to be exported by the runner
+> and ignored, while the test hardcoded 500 ms — which is why older peak numbers
+> were wrong). With each VU running ~96s, the *estimated* peak running
+> simultaneously is:
+>
+> ```
+> peak concurrent ≈ VU duration ÷ start interval ≈ 96s ÷ 1.5s ≈ 64
+> ```
+>
+> That is only an estimate — **every run measures the real value** from the
+> per-VU `WORK_START`/`WORK_END` windows and prints it. Quote the measurement,
+> not the formula:
+>
+> ```
+> [peak] executing VUs: peak=64 of 150 started (ramp span ~225s)
+> PEAK_CONCURRENT_VUS=64 STARTED_VUS=150
+> ```
+>
+> (k6's builtin `vus` metric is *not* this number — it counts VUs that are only
+> sleeping through their stagger, so it always reads the full VU count.)
+>
+> So **10 and 50 users are genuinely ~concurrent** (below the cap), but **150 users
+> means 150 total ramped over ~225s with a ~64-user peak** — not 150 simultaneous.
+> To actually hold 150 simultaneous, lower `LOAD_VU_START_INTERVAL_SECONDS`
+> (e.g. `0.5` → ~190 peak), accepting the heavier burst the backend sees, and
+> confirm it from `PEAK_CONCURRENT_VUS=`.
 
 ### 📋 All Available Commands
 
 #### Core Testing
+
 ```bat
 npm run smoke                    # Single-user validation (1 VU)
 npm run load:shared              # Concurrent users on shared project (PRIMARY)
 npm run load:shared:admin        # Same as load:shared (alias)
+npm run load:shared:keep         # Same run, but skip Phase 3 cleanup
+npm run cleanup:shared           # Delete leftovers from an earlier run
 npm run load                     # Isolated projects (1 project per VU)
 npm run load:client-project      # Client-specific load test
 npm run load:candidate           # Candidate-focused load test
 ```
 
 #### Grafana-Enabled Testing
+
 ```bat
 npm run load:shared:grafana      # Shared load with live metrics ⭐
 npm run admin:shared:grafana     # Same as above (alias)
@@ -271,6 +337,7 @@ npm run load:grafana:no-anum     # Without Anam API
 ```
 
 #### Anam AI Validation
+
 ```bat
 npm run e2e:anam:disabled        # Anam disabled flow
 npm run e2e:anam:healthy         # Anam enabled & healthy
@@ -279,6 +346,7 @@ npm run e2e:anam:network         # Network failure simulation
 ```
 
 #### Monitoring
+
 ```bat
 npm run monitoring:up            # Start Grafana + InfluxDB
 npm run monitoring:down          # Stop monitoring stack
@@ -287,10 +355,16 @@ npm run monitoring:reset         # Clear all data & restart
 ```
 
 #### Utilities
+
 ```bat
 npm run validate                 # Validate .env configuration
-npm run report:csv               # Generate CSV reports from results
+npm run report:csv               # Generate the 6 CSV files from a JSON report
+npm run cleanup:shared           # Delete leftovers from an earlier shared run
 ```
+
+> `report:professional` and `report:grafana` do **not** exist in `package.json` —
+> the HTML report is written by every run automatically, and there is no
+> InfluxDB→CSV exporter yet.
 
 ---
 
@@ -299,6 +373,7 @@ npm run report:csv               # Generate CSV reports from results
 **Purpose:** Verify the full lifecycle works end-to-end with 1 VU.
 
 ### Required `.env`:
+
 ```env
 LOAD_MODE=smoke
 SEND_PROJECT_INVITATIONS=true
@@ -312,6 +387,7 @@ npm run smoke
 ```
 
 ### What runs:
+
 ```
 1 Super Admin login
 → Create 1 Client (organization)
@@ -326,6 +402,7 @@ npm run smoke
 ```
 
 ### Expected output:
+
 ```
 checks: 100.00% ✓ 90  ✗ 0
 managed_clients_created: 1
@@ -334,11 +411,13 @@ project active: status ACTIVE ✓
 ```
 
 ### Project stays DRAFT?
+
 ```env
 SEND_PROJECT_INVITATIONS=true   ← must be true
 ```
 
 ### Candidates not performing?
+
 ```env
 CANDIDATE_EXECUTION_SOURCE=generated   ← must not be empty or none
 ```
@@ -352,6 +431,7 @@ CANDIDATE_EXECUTION_SOURCE=generated   ← must not be empty or none
 **Purpose:** N unique candidates simultaneously perform all activities on the same project.
 
 ### Required `.env`:
+
 ```env
 NUM_CANDIDATES=10          # set to how many concurrent users you want
 LOAD_VUS=10                # must equal NUM_CANDIDATES
@@ -383,9 +463,10 @@ scenario separately with the normal limits.
 npm run load:shared
 ```
 
-### Two-phase flow:
+### Three-phase flow:
 
 **Phase 1 — Provision (sequential, ~1-5 min):**
+
 ```
 Super Admin
   → Create 1 Client
@@ -397,48 +478,78 @@ Super Admin
 ```
 
 **Phase 2 — Concurrent load (VU starts are paced by the configured interval):**
+
 ```
 VU 1  → john1@ → invitation href login → 6 activities ✓
 VU 2  → john2@ → invitation href login → 6 activities ✓
 VU 3  → john3@ → invitation href login → 6 activities ✓
 ...
 VU N  → johnN@ → invitation href login → 6 activities ✓
+
+[peak] executing VUs: peak=10 of 10 started (ramp span ~14s)
+PEAK_CONCURRENT_VUS=10 STARTED_VUS=10
 ```
+
+**Phase 3 — Cleanup (runs even when Phase 2 fails):**
+
+```
+Super Admin → DELETE 150 candidates → DELETE project → DELETE organisation
+[cleanup] OK — this run left no data behind.
+```
+
+Phase 1 still sets `ENABLE_TEARDOWN=false` internally (so its own teardown does
+not delete the project Phase 2 is about to use); **Phase 3 is what actually
+deletes the run's organisation, project and candidates.** Control it with:
+
+| You want                              | Use                                              |
+| ------------------------------------- | ------------------------------------------------ |
+| auto-clean after every run (default)  | `npm run load:shared`                            |
+| keep the data for inspection          | `npm run load:shared:keep` or `ENABLE_TEARDOWN=false` |
+| clean up leftovers from an older run  | `npm run cleanup:shared SHARED_PROJECT_ID=<id> SHARED_ORG_ID=<id>` |
 
 ### Scale examples:
 
-| `.env` | Concurrent users | Phase 1 time |
-|--------|-----------------|-------------|
-| `NUM_CANDIDATES=5, LOAD_VUS=5` | 5 | ~30s |
-| `NUM_CANDIDATES=10, LOAD_VUS=10` | 10 | ~1 min |
-| `NUM_CANDIDATES=50, LOAD_VUS=50` | 50 | ~2 min |
-| `NUM_CANDIDATES=150, LOAD_VUS=150` | 150 | ~5 min |
+| `.env`                             | Concurrent users | Phase 1 time |
+| ---------------------------------- | ---------------- | ------------ |
+| `NUM_CANDIDATES=5, LOAD_VUS=5`     | 5                | ~30s         |
+| `NUM_CANDIDATES=10, LOAD_VUS=10`   | 10               | ~1 min       |
+| `NUM_CANDIDATES=50, LOAD_VUS=50`   | 50               | ~2 min       |
+| `NUM_CANDIDATES=150, LOAD_VUS=150` | 150              | ~5 min       |
 
 ### Why not `npm run load` for 150 users?
 
-`npm run load` creates one project per VU — 150 VUs = 150 concurrent `Create Client` calls = **mass 429 rate limiting**. `load:shared` creates 1 project then fires all VUs against it — no rate limit on provisioning.
+`npm run load` creates one project per VU — 150 VUs = 150 concurrent `Create Client` calls = **mass 429 rate limiting**. `load:shared` creates **one** project then paces all VUs against it, which **avoids the mass provisioning storm** (no 150 parallel `Create Client` calls). A global per-IP rate limit still applies to the backend, which is why the config uses `LOAD_TEST_INITIAL_GAP_SECONDS` / `LOAD_TEST_PHASE_GAP_SECONDS` cooldowns and a paced VU start — see the required `.env` above.
 
 ### Expected output for 10 VUs:
+
 ```
 Phase 1 complete:
   Project ID  : xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
   Candidates  : 10 hrefs captured
   Hrefs file  : C:\Users\...\AppData\Local\Temp\shared-hrefs-<ts>.b64
+  RAMP: VU start interval = 1.5s (LOAD_VU_START_INTERVAL_SECONDS)
 
 checks: 98%+
 ws_sessions: 60   (10 VUs × 6 activities)
 iterations: 10
+
+[peak] executing VUs: peak=10 of 10 started (ramp span ~14s)
+PEAK_CONCURRENT_VUS=10 STARTED_VUS=10
+
+=== Phase 3/3 — k6: delete project, org and candidates ===
+[cleanup] OK — this run left no data behind.
+=== All phases complete — Phase1=0, Phase2=0, cleanup=ok, final=0 ===
 ```
 
 ### Known dev-environment behaviors (not script bugs):
 
-| Log message | Cause | Impact |
-|------------|-------|--------|
-| `candidate portal theme: 500` | DB race condition on first concurrent portal access | Non-blocking |
-| `portal-tokens: 404` | Deprecated endpoint; shared-load setup no longer calls it | Candidate token comes from invitation response links |
-| No candidate hrefs captured | Backend is local without `EXPOSE_CANDIDATE_PORTAL_LINKS=true`, or invitation response omitted links | Enable the local-only opt-in and restart backend; the script now aborts before Phase 2 if no href exists |
-| `Accept Agreement: timeout` | Server overwhelmed at 10+ concurrent | Some VUs retry and succeed |
-| `http_req_failed > 10%` | Dev server rate limits | Expected finding |
+| Log message                   | Cause                                                                                              | Impact                                                                                                   |
+| ----------------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `candidate portal theme: 500` | DB race condition on first concurrent portal access                                                | Non-blocking                                                                                             |
+| `portal-tokens: 404`          | Deprecated endpoint; shared-load setup no longer calls it                                          | Candidate token comes from invitation response links                                                     |
+| No candidate hrefs captured   | Backend is local without`EXPOSE_CANDIDATE_PORTAL_LINKS=true`, or invitation response omitted links | Enable the local-only opt-in and restart backend; the script now aborts before Phase 2 if no href exists |
+| `Accept Agreement: timeout`   | Server overwhelmed at 10+ concurrent                                                               | Some VUs retry and succeed                                                                               |
+| `http_req_failed > 10%`       | Dev server rate limits                                                                             | **Fails the run now** — `load:shared` is gated by `config/thresholds.js` (default `dev → baseline` = < 1%). Loosen deliberately with `PERFORMANCE_PROFILE=functional` if the environment is the known cause |
 
 ---
 
@@ -447,6 +558,7 @@ iterations: 10
 **Purpose:** Each VU creates its own independent project + candidates.
 
 ### Required `.env`:
+
 ```env
 LOAD_MODE=load
 LOAD_VUS=5
@@ -461,6 +573,7 @@ npm run load
 ```
 
 **With `LOAD_VUS=5`:**
+
 ```
 VU 1 → Client A → Project A → 10 candidates → activities
 VU 2 → Client B → Project B → 10 candidates → activities
@@ -521,6 +634,13 @@ ENFORCE_BOOKING=false     # booking API returns 404 on dev — must be false
 ANUM_API_ENABLED=false    # Anam API disabled on dev
 ```
 
+> **⚠️ Known naming quirk — "Anam" vs "Anum".** The product feature is **"Anam"**
+> (the AI service), but a legacy typo produced the env var **`ANUM_API_ENABLED`**
+> and the `no-anum` npm-script/command suffix. Both spellings therefore appear in
+> the codebase and CLI (`smoke:no-anum`, `ANUM_API_ENABLED`, ...). They refer to the
+> **same thing**. Treat `ANUM_*` as an alias for `ANAM_*` — don't "fix" one without
+> the other or the scripts will break.
+
 ---
 
 ## 10. Common Mistakes & Fixes
@@ -530,6 +650,7 @@ ANUM_API_ENABLED=false    # Anam API disabled on dev
 **Cause:** `LOAD_ITERATIONS_PER_VU` set high (e.g. 10) with multiple VUs.
 
 **Fix:**
+
 ```env
 LOAD_ITERATIONS_PER_VU=1
 ```
@@ -539,6 +660,7 @@ LOAD_ITERATIONS_PER_VU=1
 **Cause:** `SEND_PROJECT_INVITATIONS=false`
 
 **Fix:**
+
 ```env
 SEND_PROJECT_INVITATIONS=true
 ```
@@ -548,6 +670,7 @@ SEND_PROJECT_INVITATIONS=true
 **Cause:** `CANDIDATE_EXECUTION_SOURCE` is empty or `none`
 
 **Fix:**
+
 ```env
 CANDIDATE_EXECUTION_SOURCE=generated
 ```
@@ -557,6 +680,7 @@ CANDIDATE_EXECUTION_SOURCE=generated
 **Cause:** `.env` is the only source of truth — `cross-env` in npm scripts is ignored.
 
 **Fix:** Update `.env` directly:
+
 ```env
 NUM_CANDIDATES=150
 LOAD_VUS=150
@@ -577,29 +701,389 @@ LOAD_VUS=150
 ### 429 Rate Limiting
 
 All HTTP calls now log:
+
 ```
 [429 RATE LIMIT] flow="Create Project Candidate 3/10" url="https://api...."
 [RETRY] ... retry 1/3 after 2s
 ```
 
-This tells you exactly which endpoint is being rate-limited. The suite retries up to 3 times with backoff.
+This tells you exactly which endpoint is being rate-limited. **By default the suite retries up to 3 times with exponential backoff** (`HTTP_429_MAX_RETRIES=3`). Load runs (`load:shared`) deliberately set `HTTP_429_MAX_RETRIES=0` so retries don't amplify throttling during measurement.
+
+### `href token not found ... expected access_token in the email login href` (prod / UAT)
+
+**Cause:** The harness does **not** read the candidate's inbox. It gets the candidate login link from the `accessMyPortal` field that the **invitation API returns** (`scenarios/projectcreation.js` → `allInvitationHrefs`). The backend only populates that field when `EXPOSE_CANDIDATE_PORTAL_LINKS=true` — a local/dev-only opt-in. For `NODE_ENV=dev` the links are included automatically, but **UAT/prod intentionally omit them** (returning candidate bearer tokens in an API response is a security risk).
+
+So pointing `API_URL` at `https://api.symulate.ai/prod/api` makes the invitation response come back **without** candidate portal links → no `access_token` → `candidateSessionFromInviteHref()` returns null → the candidate flow logs the message and returns zero activities. This is **expected in prod**, not a script bug.
+
+**Fix options:**
+
+- Run the candidate-assessment / `load:shared` flow against the **dev** backend (where links are exposed) — this is what the suite is designed for.
+- If you must load-test prod, ask the backend team to enable `EXPOSE_CANDIDATE_PORTAL_LINKS=true` on the prod env **temporarily** (explicit security trade-off), restart it, then rerun Phase 1. Do **not** leave it on in prod.
+- The harness prints this exact hint in shared-load mode when no href is captured, and aborts before Phase 2 rather than running a meaningless load.
 
 ---
 
 ## 11. Reports
 
-All runs write to `reports/`:
+All runs automatically generate comprehensive reports in `reports/`:
 
-| File | Content |
-|------|---------|
-| `*.html` | Interactive HTML report |
-| `*.json` | Raw k6 metrics |
-| `*-overview.csv` | High-level summary |
-| `*-checks.csv` | Per-check results |
+### Automatic Report Generation
 
-Playwright artifacts: `playwright/artifacts/`
+Every k6 run automatically writes **HTML + JSON** (from `handleSummary()` in the
+test file) and both runners write **`failures-latest.json`**. The **6 CSV files**
+are *derived* from the JSON report and are produced on demand:
 
-All report files are Git-ignored.
+```bat
+npm run report:csv
+```
+
+#### Generated Files:
+
+| File Type                          | Content                                   | Use Case                                 |
+| ---------------------------------- | ----------------------------------------- | ---------------------------------------- |
+| **HTML** (auto)                    | Interactive dashboard                     | Quick visual review in browser           |
+| **JSON** (auto)                    | Raw k6 metrics                            | Programmatic analysis, CI/CD integration |
+| **-overview.csv** (report:csv)     | High-level summary                        | Executive summary, quick metrics         |
+| **-summary.csv** (report:csv)      | Per-endpoint JMeter-style                 | Performance comparison, SLA validation   |
+| **-aggregate.csv** (report:csv)    | With percentiles (P90/P95/P99)            | Detailed latency distribution            |
+| **-checks.csv** (report:csv)       | All assertion results                     | Test validation, failure analysis        |
+| **-url-details.csv** ⭐ (report:csv)| Complete URL list with metrics            | **"Which URLs were hit?"** analysis      |
+| **-all-metrics.csv** ⭐ (report:csv)| Every k6 metric                           | Complete test execution data             |
+| **failures-latest.json** (auto)    | Per-request failures (code + message)     | Post-run triage; diffed between runs     |
+
+> `failures-latest.json` is a **sidecar**: the HTML report still shows only the
+> *aggregate* failure rate, per-request detail is read from this file (or the
+> run log). See [Failed Request Capture](#failed-request-capture-status-code--message).
+
+### Report Naming Convention
+
+All reports use a consistent **`symulate`** prefix (the separate "happening" project uses its own naming — never mix the two). The base name is built by `reportName()` in `utils/helpers.js`:
+
+```
+<prefix>-<LOAD_MODE>-<SCENARIO>[-<anam-tag>]-<timestamp>
+```
+
+- **Prefix is always `symulate...`** — e.g. `symulate-smoke-full`, `symulate-shared-admin-candidate-load`.
+- **Anam tag** (`-with-anam` / `-without-anam`) is added **only** for Anam-outage runs: `SCENARIO=situation-only`, or the anam/anum commands (`smoke:no-anum:setup`, `smoke:no-anum:perform`, `smoke:no-anum:session-audit`). **Normal runs carry no tag.**
+
+Derived filenames always start from a clean base (`report-utils.js` strips legacy `symulate-`/`symulate-report-`/`PROFESSIONAL-`/`report-` prefixes):
+
+| Output                             | Pattern                                                                                  |
+| ---------------------------------- | ---------------------------------------------------------------------------------------- |
+| k6 native HTML/JSON                | `symulate-<base>.json` (written by the test)                                             |
+| Professional HTML                  | `symulate-<base>.html`                                                                   |
+| 6-file CSV set (`npm run report:csv`)| `symulate-report-<base>-{overview,summary,aggregate,checks,url-details,all-metrics}.csv` |
+| Failure sidecar (automatic)        | `failures-latest.json`                                                                   |
+| Failure sidecar                    | `failures-latest.json`                                                                   |
+
+### Failed Request Capture (status code + message)
+
+k6's summary only reports the **aggregated** failure rate — never _which_ request failed or _why_. This suite captures every failed request at the source:
+
+1. **`utils/http.js`** — every wrapper funnels through `requestWithRetry()`, which for the **final** response of any call with **status ≥ 400** (or a thrown network error) emits one structured line:
+
+   ```
+   [FAILED_REQUEST] {"name":"Login - Load Test Admin","method":"POST","url":"https://api.../auth/login","status":429,"errorCode":1429,"message":"Too many login attempts...","at":"2026-10-16T07:36:47Z"}
+   ```
+
+   The `message` is pulled from the JSON body's `message`/`error` field (else the raw body, else the network error text). Intermediate 429s that later retry successfully are not reported — only the final outcome is.
+
+2. **`scripts/run.js` and `scripts/run-shared-project-load.js`** tee k6's stdout/stderr, parse those lines (the shared runner accumulates them across all phases), and write `reports/failures-latest.json` on **every** run — an empty array clears stale failures from a previous run.
+
+> **Known gap:** the HTML report still renders only the *aggregate* failure rate;
+> it does **not** yet contain a per-request "Failed Requests" table. Read
+> `failures-latest.json` (or the run log) for that detail.
+
+> `failures-latest.json` is a sidecar, not a k6 report — the report picker (`latestJsonReport()`) explicitly excludes it (it only matches `report-*.json`) so it's never mistaken for test data.
+
+### CSV Report Details
+
+**1. overview.csv** - Executive Summary
+
+```csv
+Metric,Value
+Report Type,Symulate Load Test Report
+Generated At,2026-10-15T12:17:39Z
+Total Requests,171
+Failed Requests,0
+Failed Request %,0
+Total Checks,282
+Checks Passed %,100
+Total Iterations,10
+Total VUs,10
+Avg Response Time (ms),237.01
+P95 Response Time (ms),451.09
+P99 Response Time (ms),620.57
+Total Data Received (bytes),2447360
+Total Data Sent (bytes),10660
+WebSocket Sessions,60
+WS Messages Sent,640
+WS Messages Received,1190
+```
+
+**2. url-details.csv** ⭐ (NEW!)
+
+```csv
+URL/Endpoint,# Requests,Avg (ms),Median (ms),Min (ms),Max (ms),P90 (ms),P95 (ms),P99 (ms)
+Login - Client Admin,10,315.2,310.5,290.1,355.8,340.2,350.0,355.0
+Get Project Details,10,201.4,198.5,180.2,250.3,230.5,240.1,248.0
+Create Project Candidate 1/10,10,277.0,270.0,240.0,310.0,295.0,305.0,309.0
+...all endpoints listed...
+```
+
+**Shows exactly which APIs were called and their performance!**
+
+**3. all-metrics.csv** ⭐ (NEW!)
+
+```csv
+Metric Name,Count,Rate (%),Avg,Min,Median,Max,P90,P95,P99
+http_reqs,171,0,0,0,0,0,0,0,0
+http_req_duration,171,0,237.01,146.7,198.07,1220,351.81,451.09,620.57
+http_req_failed,0,0,0,0,0,0,0,0,0
+ws_sessions,60,0,0,0,0,0,0,0,0
+ws_msgs_sent,640,0,0,0,0,0,0,0,0
+iterations,10,0,96000,79000,97000,113000,109000,111000,113000
+vus_max,10,0,10,10,10,10,10,10,10
+...complete metrics...
+```
+
+**Every metric k6 captured, in one file!**
+
+### Example: After Running `npm run load:shared`
+
+```
+reports/
+├── symulate-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json   (raw k6 data)
+├── symulate-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html   (professional ⭐)
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-overview.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-summary.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-aggregate.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-checks.csv
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-url-details.csv  ⭐
+├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-all-metrics.csv  ⭐
+└── failures-latest.json   (per-request failures → post-run triage / CI artifact)
+```
+
+### Manual CSV Generation
+
+If you need to regenerate CSVs from an existing JSON report:
+
+```bat
+npm run report:csv
+```
+
+This finds the latest JSON report and generates all 6 CSV files.
+
+### Opening Reports
+
+**HTML Report:**
+
+```bat
+# Open in browser (Windows)
+start reports\shared-admin-candidate-load-*.html
+```
+
+**CSV Reports:**
+
+```bat
+# Open in Excel
+start reports\symulate-report-*-url-details.csv
+```
+
+**Professional HTML Report:**
+
+```bat
+# Open comprehensive report in browser (Windows)
+start reports\symulate-*.html
+```
+
+---
+
+## Professional Load Test Reports
+
+Every test automatically generates a **comprehensive, industry-standard HTML report** with:
+
+### 9-Section Report Structure
+
+#### 1. 📊 Executive Summary
+
+- Test objective and scope
+- Test duration and environment
+- Key performance metrics (requests, throughput, response time)
+- Critical issues count with severity breakdown
+
+#### 2. ⚙️ Test Configuration
+
+- Environment (staging/prod)
+- Virtual Users (VUs)
+- Test duration
+- Scenario details
+
+#### 3. 📈 Summary Graphs & Charts
+
+- Response time distribution
+- Data transfer visualization
+- _Note: Charts show test totals; see Grafana for real-time graphs_
+
+#### 4. 🎯 Performance Metrics
+
+**HTTP Metrics:**
+
+- Total requests
+- Requests/sec rate
+- Response time percentiles (p50, p90, p95, p99)
+- Connection time breakdown (connecting, TLS handshaking, sending, waiting, receiving)
+
+**WebSocket Metrics:**
+
+- Active sessions
+- Messages sent/received
+- Session duration
+
+**Throughput:**
+
+- Data received/sent
+- Network efficiency
+
+#### 5. 🔍 Endpoint Analysis
+
+- Per-URL performance breakdown
+- Request counts per endpoint
+- Response time statistics (avg/median/min/max/p90/p95/p99)
+- _Links to detailed url-details.csv_
+
+#### 6. ⚠️ Detailed Findings
+
+**Automatic Issue Detection** with severity classification:
+
+| Severity       | Badge Color | Error Rate | p95 Response Time |
+| -------------- | ----------- | ---------- | ----------------- |
+| 🔴**Critical** | Red         | >5%        | >3000ms           |
+| 🟠**High**     | Orange      | >2%        | >2000ms           |
+| 🟡**Medium**   | Yellow      | >1%        | >1000ms           |
+| 🟢**Low**      | Green       | <1%        | <1000ms           |
+
+**Each finding includes:**
+
+- Description of the issue
+- Evidence (actual metrics)
+- Actionable recommendations
+
+**Example Finding:**
+
+```
+⚠️ HIGH - High Error Rate (3.2%)
+
+Evidence:
+- Error rate: 3.2% (5 failed / 171 total)
+- Threshold: 2%
+
+Recommendations:
+- Investigate server logs for 5xx errors
+- Check database connection pool
+- Review rate limiting configuration
+```
+
+#### 7. ✅ Test Validation
+
+- Total checks performed
+- Pass/fail counts
+- Pass percentage
+
+#### 8. 📋 Methodology
+
+- Test approach and objectives
+- Tools used (k6, Grafana, InfluxDB, Playwright)
+- Test phases (provisioning, load execution)
+- Load pattern description
+
+#### 9. 📎 Appendices
+
+- Links to all 6 CSV reports
+- Raw JSON data reference
+- Test script information
+- Environment variables
+
+### File Naming Convention
+
+```
+symulate-{original-report-name}.html
+```
+
+**Example:**
+
+```
+reports/
+├── symulate-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json  (raw k6 data)
+├── symulate-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html  ⭐ (professional)
+├── symulate-report-...-overview.csv
+├── symulate-report-...-summary.csv
+├── symulate-report-...-aggregate.csv
+├── symulate-report-...-checks.csv
+├── symulate-report-...-url-details.csv
+└── symulate-report-...-all-metrics.csv
+```
+
+### Auto-Generation
+
+Professional reports are **automatically generated** after every test run:
+
+```bat
+npm run load:shared          # ✓ Auto-generates professional report
+npm run smoke:grafana        # ✓ Auto-generates professional report
+npm run load:shared:grafana  # ✓ Auto-generates professional report
+```
+
+### Manual Generation
+
+Regenerate professional report from latest JSON:
+
+```bat
+npm run report:professional
+```
+
+### Report Features
+
+**Responsive Design:**
+
+- Mobile-friendly layout
+- Print-optimized CSS
+- Collapsible sections
+
+**Color-Coded Severity:**
+
+- Critical: Red (#dc3545)
+- High: Orange (#fd7e14)
+- Medium: Yellow (#ffc107)
+- Low: Green (#28a745)
+
+**Executive-Ready:**
+
+- Non-technical executive summary
+- Visual metric presentation
+- Clear actionable findings
+- Professional formatting
+
+### Use Cases
+
+1. **Stakeholder Reports** - Share with management/clients
+2. **Performance Baseline** - Document performance benchmarks
+3. **Regression Testing** - Compare against previous runs
+4. **Capacity Planning** - Evidence for infrastructure decisions
+5. **Post-Mortem Analysis** - Detailed incident investigation
+
+### Playwright Artifacts
+
+Browser automation artifacts stored separately:
+
+```
+playwright/artifacts/
+├── screenshots/
+├── videos/
+└── traces/
+```
+
+All report files are Git-ignored for security and size.
 
 ---
 
@@ -621,20 +1105,20 @@ npm run smoke:grafana
 # Step 3: Open dashboard
 ```
 
-Access live dashboard: **http://localhost:3000** (admin/admin)
+Access live dashboard: **http://localhost:3001** (admin/admin)
 
 ### Available Grafana Commands
 
-| Command | Purpose |
-|---------|---------|
-| `npm run monitoring:up` | Start Grafana + InfluxDB containers |
-| `npm run monitoring:down` | Stop monitoring stack |
-| `npm run monitoring:status` | Check if containers are running |
-| `npm run monitoring:reset` | Remove all data & restart fresh |
-| `npm run load:shared:grafana` | Shared-project load with live metrics |
-| `npm run admin:shared:grafana` | Same as above (alias) |
-| `npm run smoke:grafana` | Smoke test with live metrics |
-| `npm run load:grafana` | Isolated load test with live metrics |
+| Command                        | Purpose                               |
+| ------------------------------ | ------------------------------------- |
+| `npm run monitoring:up`        | Start Grafana + InfluxDB containers   |
+| `npm run monitoring:down`      | Stop monitoring stack                 |
+| `npm run monitoring:status`    | Check if containers are running       |
+| `npm run monitoring:reset`     | Remove all data & restart fresh       |
+| `npm run load:shared:grafana`  | Shared-project load with live metrics |
+| `npm run admin:shared:grafana` | Same as above (alias)                 |
+| `npm run smoke:grafana`        | Smoke test with live metrics          |
+| `npm run load:grafana`         | Isolated load test with live metrics  |
 
 ### What You'll See in Dashboard
 
@@ -656,33 +1140,35 @@ k6 Test Run
      ↓
 InfluxDB (port 8087)
      ↓
-Grafana Dashboard (port 3000)
+Grafana Dashboard (port 3001)
      ↓
 Real-time visualization
 ```
 
-**Metrics push interval**: Every 3 seconds  
+**Metrics push interval**: Every 3 seconds
 **Data retention**: Persists until `npm run monitoring:reset`
 
 ### Troubleshooting
 
 **Dashboard shows "No Data"?**
+
 ```bat
 # Check containers are running
 npm run monitoring:status
 
 # Verify InfluxDB has data
-docker exec symulate-influxdb influx -execute "SHOW DATABASES"
-docker exec symulate-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"
+docker exec k6-influxdb influx -execute "SHOW DATABASES"
+docker exec k6-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"
 ```
 
 **Containers won't start?**
+
 ```bat
 # Check Docker is running
 docker --version
 
 # Check ports are free
-netstat -an | findstr "3000 8087"
+netstat -an | findstr "3001 8087"
 
 # Reset everything
 npm run monitoring:reset
@@ -691,11 +1177,196 @@ npm run monitoring:up
 
 For complete Grafana setup guide, see: **[monitoring/GRAFANA_SETUP.md](monitoring/GRAFANA_SETUP.md)**
 
+### Exporting Grafana Data
+
+**Status: not implemented yet — known gap.**
+
+Metrics are pushed to InfluxDB every 3 seconds and rendered live in Grafana.
+There is **no `npm run report:grafana` CSV exporter in this repository**, and the
+`:grafana` npm scripts do not export anything after the run — they only add
+k6's `--out influxdb=...` output (and `load:shared:grafana` now applies it to
+**both** phases).
+
+To analyse a run's numbers, use one of these instead:
+
+- `npm run report:csv` — the 6-file CSV set built from the run's k6 JSON
+  (`reports/failures-latest.json` for per-request failures).
+- Query InfluxDB directly, e.g.
+  `docker exec k6-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"`
+- Export a Grafana panel as CSV from the panel menu (raw time series).
+- `reports/*.json` — full k6 summary, readable from any script.
+
+> InfluxDB accumulates metrics across _all_ runs forever until
+> `npm run monitoring:reset`. Note that `name` is a reserved InfluxQL word and
+> must be quoted (`"name"`) in ad-hoc queries.
+
+---
+
+## SLA / Pass-Fail Criteria (Thresholds)
+
+A load test is only useful if it can **pass or fail against a target**. This suite
+encodes SLA/NFR budgets as **k6 thresholds** in [`config/thresholds.js`](config/thresholds.js),
+so any breached budget makes k6 exit non-zero (usable directly as a CI gate).
+
+### Profile selection (first match wins)
+
+1. `PERFORMANCE_PROFILE` env var — `auto | strict | standard | baseline | functional`
+2. `ENV_PROFILE` env var — `production` → strict, `staging` → standard, `dev` → baseline
+3. `LOAD_MODE` fallback (when the above are `auto`) — `smoke` → strict, `load` → baseline
+
+### Global gates per profile
+
+| Profile (target)        | Error rate | p95        | p99         | Checks    |
+| ----------------------- | ---------- | ---------- | ----------- | --------- |
+| **strict** (production) | `< 1%`     | `< 2000ms` | `< 3500ms`  | `> 99%`   |
+| **standard** (staging)  | `< 1%`     | `< 2000ms` | `< 6000ms`  | `> 99%`   |
+| **baseline** (dev)      | `< 1%`     | `< 2000ms` | `< 12000ms` | `> 99%`   |
+| **functional**          | `< 1%`     | — (reported only) | —   | `> 99%`   |
+
+### Per-endpoint p95 SLOs
+
+Every named request also carries a **p95 latency SLO** (kept constant across profiles —
+p95 reflects the request path itself, not how loaded the environment is). Examples:
+
+| Endpoint                                        | p95 SLO  |
+| ----------------------------------------------- | -------- |
+| `Login - Super Admin` / `Login - Client Admin`  | 1500ms   |
+| `Create Client` / `Create Project` / `Assign Task` | 2000ms |
+| `Create Task`                                   | 2500ms   |
+| `Import Candidates (CSV)`                       | 3000ms   |
+| `Submit Activity`                               | 3000ms   |
+| `Submit Activity (Anam evaluation)`             | 5000ms   |
+| `Project Review - *`                            | 1500–2000ms |
+
+> **p99 is derived** per profile (multiplier on p95) and **widened by `LOAD_SCALE`** at
+> higher VU counts, so environment queueing under concurrent writes doesn't fail the
+> gate when every HTTP request itself succeeds.
+
+### Example: gate a run on a production SLA
+
+```bat
+PERFORMANCE_PROFILE=strict npm run load:shared
+```
+
+Any breach (error rate ≥ 1%, p95 ≥ 2s, or checks ≤ 99%) → **k6 exits non-zero** → CI fails.
+
+> **Every test in this repo is gated by `buildThresholds()`** — `smoke`, `load`,
+> `load:client-project`, `load:candidate`, `load:review` **and** `load:shared`
+> (`tests/shared-project-admin-candidate-load.js`). That primary command used to
+> hardcode `rate<0.15` / `p95<8000`, so a run with 14% failed requests passed;
+> it now honours the profile table above.
+>
+> On a noisy dev box the default `dev → baseline` gate (<1% errors, p95 < 2s) can
+> be too tight for a 150-VU burst. Loosen it **deliberately** instead of removing
+> the gate: `PERFORMANCE_PROFILE=functional npm run load:shared` (correctness +
+> checks only), or `ENV_PROFILE=staging` → `standard`. See
+> [Profile selection](#profile-selection-first-match-wins).
+
+---
+
+## CI/CD Integration & Exit Codes
+
+Every runner exits with a code a pipeline can gate on:
+
+| Exit code | Meaning                                                                    |
+| --------- | -------------------------------------------------------------------------- |
+| `0`       | Pass — all thresholds met, and (for `load:shared`) Phase 3 cleanup succeeded |
+| `1`       | Fail — threshold breach, a phase/test failure, **or a failed cleanup**     |
+| `2`       | Infra error — k6 failed to start / internal runner error                   |
+
+Notes:
+
+- k6 itself exits **99** when thresholds are breached. Both `scripts/run.js` and
+  `scripts/run-shared-project-load.js` normalise 99 → **1**, so a threshold breach
+  surfaces as the documented `1` (the shared runner also reports
+  `cleanup=ok|FAILED` in its final line).
+- k6 can still pass through **other non-zero codes** for its own failures — a
+  script exception was observed exiting **107** (v2.2.0), for example. The rule a
+  pipeline should rely on is simply: **`0` = pass, anything else = fail.**
+- `load:shared` fails the run if **Phase 3 cleanup** fails: a green run that leaks
+  an organisation, a project and `NUM_CANDIDATES` candidates into the environment
+  is not green. Skip cleanup explicitly with `--no-cleanup` / `ENABLE_TEARDOWN=false`
+  when you need to inspect the created data.
+
+Reports written on **every** run — including failed ones — so a pipeline can
+always archive `reports/` as artifacts:
+
+- HTML + JSON (from the test's `handleSummary()`)
+- `failures-latest.json` (both runners)
+- the 6 CSV files, via `npm run report:csv` (run it as a separate `if: always()` step)
+
+### Real pipeline file
+
+The repository ships **[`.github/workflows/load-test.yml`](.github/workflows/load-test.yml)**
+(the remote is **GitHub** — there is no `bitbucket-pipelines.yml`):
+
+| Job           | Trigger                         | What it does                                                        |
+| ------------- | ------------------------------- | ------------------------------------------------------------------- |
+| `smoke`       | every PR + manual dispatch      | 1-VU smoke test = the PR gate; archives `reports/`                  |
+| `load-shared` | manual `workflow_dispatch` only | choose 10/50/150 VUs, profile, ramp interval, cleanup on/off        |
+
+Two things the workflow does that a naïve snippet gets wrong:
+
+1. **Materialises `.env` from Actions secrets** — `scripts/run.js` reads only
+   `.env` (it deliberately does *not* forward OS environment variables to k6), so
+   `env:` on a step alone is not enough.
+2. **Prints the measured peak** (`PEAK_CONCURRENT_VUS=`) from the run log instead
+   of inferring concurrency from the ramp formula.
+
+Minimal step, if you keep your own pipeline (copy the "Create .env" step from
+the workflow file above — it is the part that is easy to get wrong):
+
+```yaml
+- name: Create .env from secrets
+  env:
+    SUPER_ADMIN_EMAIL: ${{ secrets.SUPER_ADMIN_EMAIL }}
+    SUPER_ADMIN_PASSWORD: ${{ secrets.SUPER_ADMIN_PASSWORD }}
+  run: |
+    cp .env.example .env
+    grep -q '^SUPER_ADMIN_EMAIL=$' .env   # then fill every required key — see the workflow
+- name: Run load test (strict SLA)
+  run: PERFORMANCE_PROFILE=strict npm run load:shared
+- name: CSVs for artifact diffing
+  if: always()
+  run: npm run report:csv
+# A non-zero exit (1) from the load step fails the job → PR blocked.
+```
+
+> **Run-over-run regression comparison** is not built in yet — diff the
+> `*-summary.csv` / `*-overview.csv` artifacts between runs, or pin a thresholds
+> baseline in CI.
+
+---
+
+## Test Coverage & Known Gaps
+
+**Implemented test types:**
+
+| Type        | Command                              | Purpose                                        |
+| ----------- | ------------------------------------ | ---------------------------------------------- |
+| Smoke       | `npm run smoke`                      | Single-user end-to-end validation              |
+| Load        | `npm run load:shared`                | Gradual-ramp throughput at a target scale      |
+| Resilience  | `npm run e2e:anam:outage503` / `:network` | Behaviour during an AI-service outage     |
+
+**Known gaps (roadmap — not yet implemented, stated honestly):**
+
+- **Stress / spike / soak** scenarios (breaking-point, burst, endurance)
+- **Server-side metrics** (CPU, memory, DB connections) correlated with k6 results — the Grafana stack currently shows **client-side (k6) metrics only**
+- **Automated run-over-run regression comparison** in CI
+- **InfluxDB/Grafana → CSV exporter** (`report:grafana`) — query InfluxDB directly or export Grafana panels manually
+- **Per-request failure table in the HTML report** — data is captured in `reports/failures-latest.json`, but the HTML still shows only the aggregate failure rate
+- **CSVs auto-generated after each run** — the 6 CSV files still need `npm run report:csv`
+- **Non-routable seed candidates** — `data/candidates.csv` still contains 150 public `yopmail.com` addresses
+
+These are intentionally out of scope for the current suite; `config/thresholds.js`
+and the Grafana/InfluxDB stack are the intended integration points for them.
+
 ---
 
 ## Recommended Configurations
 
 ### Smoke test (verify full flow):
+
 ```env
 LOAD_MODE=smoke
 SEND_PROJECT_INVITATIONS=true
@@ -704,11 +1375,13 @@ NUM_CANDIDATES=10
 LOAD_ITERATIONS_PER_VU=1
 ENFORCE_BOOKING=false
 ```
+
 ```bat
 npm run smoke
 ```
 
 ### 10 concurrent users (verify load flow):
+
 ```env
 NUM_CANDIDATES=10
 LOAD_VUS=10
@@ -716,11 +1389,13 @@ LOAD_MAX_DURATION=10m
 SEND_PROJECT_INVITATIONS=false
 ENFORCE_BOOKING=false
 ```
+
 ```bat
 npm run load:shared
 ```
 
 ### 150 concurrent users (full load test):
+
 ```env
 NUM_CANDIDATES=150
 LOAD_VUS=150
@@ -728,10 +1403,10 @@ LOAD_MAX_DURATION=30m
 SEND_PROJECT_INVITATIONS=false
 ENFORCE_BOOKING=false
 ```
+
 ```bat
 npm run load:shared
 ```
-
 
 ---
 
@@ -740,54 +1415,78 @@ npm run load:shared
 ### Key Implementation Details
 
 **1. Two-Phase Architecture (`scripts/run-shared-project-load.js`)**
+
 - Phase 1 provisions project sequentially (avoids rate limits)
 - Phase 2 runs concurrent load with pre-captured invitation URLs
 - Base64 encoding used to pass large invitation data between phases
 - Automatic cleanup of temporary files
 
 **2. Environment Variable Injection**
+
 - `scripts/run.js` reads `.env` and injects as k6 `-e` flags
 - Oversized values (>4000 chars) written to temp files to avoid Windows ARG_MAX limits
 - All tests use same environment abstraction
 
-**3. WebSocket Handling (`utils/websocket-client.js`)**
+**3. WebSocket Handling (`utils/socketConversation.js`)**
+
 - Simulates real AI conversation flow
 - Staggered connection timing (prevents thundering herd)
 - Automatic reconnection with exponential backoff
 - Conversation state management per VU
 
-**4. Retry Logic (`utils/http-client.js`)**
+**4. HTTP Wrapper (`utils/http.js`)**
+
 - 429 rate limits: 3 retries with exponential backoff
 - Detailed logging shows which endpoint is rate-limited
 - Configurable via `HTTP_429_MAX_RETRIES` in .env
+- Tags every request with `name` **and full `url`** (stored in InfluxDB for URL-level reports)
+- Emits a structured `[FAILED_REQUEST] {json}` line per failed request
+  (status code + response-body message), which both runners scrape into
+  `reports/failures-latest.json` (the HTML report still shows only the
+  aggregate failure rate)
 
 **5. Rate Limit Management**
+
 - 65-second gaps between phases (global IP rate limit window)
 - VU start interval: 1.5s (controlled candidate onboarding)
 - Admin operations use shared token across all VUs
 
 **6. Grafana Integration**
+
 - `--grafana` flag adds InfluxDB output to k6 runs
 - 3-second push interval for near-real-time metrics
 - Dashboard auto-provisions via Docker volume mounts
 
 **7. Data Isolation**
+
 - Each test run uses unique timestamp-based IDs
 - Candidates created with `john{N}.load.{timestamp}.{vu}@yopmail.com` pattern
 - Projects tagged for easy identification
 
 **8. Error Handling**
+
 - Graceful degradation on booking API 404 (dev environment)
 - Portal theme 500 errors logged but don't fail test
 - WebSocket failures retry with circuit breaker pattern
 
 ### Performance Characteristics
 
-| Scale | Phase 1 Duration | Phase 2 Duration | Total Time | Memory Usage |
-|-------|------------------|------------------|------------|--------------|
-| 10 VUs | ~60s | ~120s | ~3min | ~200MB |
-| 50 VUs | ~120s | ~180s | ~7min | ~500MB |
-| 150 VUs | ~300s | ~300s | ~12min | ~1GB |
+| Scale   | Phase 1 Duration | Phase 2 Duration | Total Time | Peak Concurrent | Memory Usage |
+| ------- | ---------------- | ---------------- | ---------- | --------------- | ------------ |
+| 10 VUs  | ~60s             | ~120s            | ~3min      | ~10             | ~200MB       |
+| 50 VUs  | ~120s            | ~180s            | ~7min      | ~50             | ~500MB       |
+| 150 VUs | ~300s            | ~300s            | ~12min     | ~64 ⚠️          | ~1GB         |
+
+> **Peak Concurrent ≠ VU count.** VUs are started paced by
+> `LOAD_VU_START_INTERVAL_SECONDS` (1.5s). Because each VU runs ~96s, the number
+> running at the *same instant* saturates at ≈ `96 ÷ 1.5 ≈ 64`. So `NUM_CANDIDATES=150`
+> delivers **150 total users with a ~64-user peak**, ramped over ~225s — not 150
+> simultaneous. **Confirm the actual number from the `PEAK_CONCURRENT_VUS=` line
+> the runner prints at the end of every Phase 2** — the formula is only an
+> estimate, and k6's builtin `vus` metric overstates it (it counts VUs sleeping
+> through their stagger). See the note in [Quick Start](#4-quick-start--which-command-to-use).
+>
+> Phase 3 (cleanup) adds ~10–30s on top of these durations.
 
 ### Security Notes
 
@@ -805,13 +1504,3 @@ npm run load:shared
 5. **Clean state**: Use `monitoring:reset` between major test runs
 
 ---
-
-## 📞 Support & Contribution
-
-For issues or questions:
-1. Check [Common Mistakes & Fixes](#10-common-mistakes--fixes)
-2. Review [monitoring/GRAFANA_SETUP.md](monitoring/GRAFANA_SETUP.md) for Grafana issues
-3. Run `npm run validate` to check environment setup
-
-**Project maintained by**: Symulate AI Engineering Team  
-**Last updated**: January 2025

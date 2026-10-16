@@ -16,6 +16,7 @@ import { htmlReport } from '../utils/local-report.js';
 import { b64decode } from 'k6/encoding';
 
 import { ANUM_API_ENABLED, SCENARIO, LOAD_MODE } from '../config/environments.js';
+import { buildThresholds } from '../config/thresholds.js';
 import { reportName, log } from '../utils/helpers.js';
 import {
   candidateSessionFromInviteHref,
@@ -59,10 +60,9 @@ export const options = {
       gracefulStop: '90s'
     }
   },
-  thresholds: {
-    http_req_failed: ['rate<0.10'],   // allow up to 10% failure for dev env rate limits
-    http_req_duration: ['p(95)<5000'] // 5s p95
-  }
+  // Profile-driven budgets (config/thresholds.js) — same gate as every other
+  // test in this repo. Override with PERFORMANCE_PROFILE / ENV_PROFILE.
+  thresholds: buildThresholds()
 };
 
 export function setup() {

@@ -1,0 +1,216 @@
+# Load-test pipeline.
+#
+# Why this exists: the README documented CI gating (and a GitHub Actions
+# example) but the repository had no pipeline file at all, so nothing was
+# actually gated. This workflow is the real gate — a non-zero exit from k6
+# (threshold breach → 1) fails the job.
+#
+# Secrets required (Settings → Secrets and variables → Actions):
+#   API_URL, SUPER_ADMIN_URL, CLIENT_ADMIN_URL, CANDIDATE_URL,
+#   SUPER_ADMIN_EMAIL, SUPER_ADMIN_PASSWORD
+# Optional:
+#   CLIENT_ADMIN_EMAIL, CLIENT_ADMIN_PASSWORD, LOAD_TEST_ADMIN_EMAIL,
+#   LOAD_TEST_ADMIN_PASSWORD
+#
+# Notes:
+#   - Reports land in reports/ and are archived on every run, including failures.
+#   - The load job is manual (workflow_dispatch) on purpose: it provisions a
+#     real project/org/candidates and puts real load on the environment.
+#   - Phase 3 cleanup runs by default (ENABLE_TEARDOWN=true); pass
+#     `--no-cleanup` only when you need to inspect the created data.
+
+name: load-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: 'VUs + candidates for load:shared'
+        type: choice
+        options: [10, 50, 150]
+        default: 10
+      performance_profile:
+        description: 'Threshold profile (config/thresholds.js)'
+        type: choice
+        options: [strict, standard, baseline, functional]
+        default: baseline
+      vu_start_interval:
+        description: 'Seconds between VU starts (ramp pacing)'
+        default: '1.5'
+      cleanup:
+        description: 'Delete the org/project/candidates after the run'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      smoke_only:
+        description: 'Run only the 1-VU smoke test (skip the load run)'
+        type: boolean
+        default: false
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Smoke (1 VU, pass/fail gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D68
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install -y k6
+          k6 version
+
+      - name: Create .env from template + secrets
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          SUPER_ADMIN_URL: ${{ secrets.SUPER_ADMIN_URL }}
+          CLIENT_ADMIN_URL: ${{ secrets.CLIENT_ADMIN_URL }}
+          CANDIDATE_URL: ${{ secrets.CANDIDATE_URL }}
+          SUPER_ADMIN_EMAIL: ${{ secrets.SUPER_ADMIN_EMAIL }}
+          SUPER_ADMIN_PASSWORD: ${{ secrets.SUPER_ADMIN_PASSWORD }}
+          CLIENT_ADMIN_EMAIL: ${{ secrets.CLIENT_ADMIN_EMAIL }}
+          CLIENT_ADMIN_PASSWORD: ${{ secrets.CLIENT_ADMIN_PASSWORD }}
+        run: |
+          cp .env.example .env
+          set_kv() {
+            key="$1"; value="$2"
+            [ -n "$value" ] || return 0
+            grep -q "^${key}=" .env && sed -i "s|^${key}=.*|${key}=${value}|" .env || echo "${key}=${value}" >> .env
+          }
+          set_kv API_URL "$API_URL"
+          set_kv SUPER_ADMIN_URL "$SUPER_ADMIN_URL"
+          set_kv CLIENT_ADMIN_URL "$CLIENT_ADMIN_URL"
+          set_kv CANDIDATE_URL "$CANDIDATE_URL"
+          set_kv SUPER_ADMIN_EMAIL "$SUPER_ADMIN_EMAIL"
+          set_kv SUPER_ADMIN_PASSWORD "$SUPER_ADMIN_PASSWORD"
+          set_kv CLIENT_ADMIN_EMAIL "$CLIENT_ADMIN_EMAIL"
+          set_kv CLIENT_ADMIN_PASSWORD "$CLIENT_ADMIN_PASSWORD"
+
+          # Fail fast instead of running a test that cannot log in.
+          for key in API_URL SUPER_ADMIN_URL CLIENT_ADMIN_URL CANDIDATE_URL SUPER_ADMIN_EMAIL SUPER_ADMIN_PASSWORD; do
+            if grep -q "^${key}=$" .env; then
+              echo "::error::Missing required secret: ${key}"
+              exit 1
+            fi
+          done
+          # Never print the assembled file — it contains credentials.
+          echo ".env assembled from template + secrets"
+
+      - name: Run smoke test (gate)
+        run: npm run smoke
+
+      - name: Archive reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-reports
+          path: reports/
+          if-no-files-found: ignore
+
+  load-shared:
+    name: Shared-project load run (${{ inputs.scale }} VUs)
+    if: github.event_name == 'workflow_dispatch' && inputs.smoke_only == false
+    runs-on: ubuntu-latest
+    needs: smoke
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D68
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install -y k6
+          k6 version
+
+      - name: Create .env from template + secrets
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          SUPER_ADMIN_URL: ${{ secrets.SUPER_ADMIN_URL }}
+          CLIENT_ADMIN_URL: ${{ secrets.CLIENT_ADMIN_URL }}
+          CANDIDATE_URL: ${{ secrets.CANDIDATE_URL }}
+          SUPER_ADMIN_EMAIL: ${{ secrets.SUPER_ADMIN_EMAIL }}
+          SUPER_ADMIN_PASSWORD: ${{ secrets.SUPER_ADMIN_PASSWORD }}
+          CLIENT_ADMIN_EMAIL: ${{ secrets.CLIENT_ADMIN_EMAIL }}
+          CLIENT_ADMIN_PASSWORD: ${{ secrets.CLIENT_ADMIN_PASSWORD }}
+        run: |
+          cp .env.example .env
+          set_kv() {
+            key="$1"; value="$2"
+            [ -n "$value" ] || return 0
+            grep -q "^${key}=" .env && sed -i "s|^${key}=.*|${key}=${value}|" .env || echo "${key}=${value}" >> .env
+          }
+          set_kv API_URL "$API_URL"
+          set_kv SUPER_ADMIN_URL "$SUPER_ADMIN_URL"
+          set_kv CLIENT_ADMIN_URL "$CLIENT_ADMIN_URL"
+          set_kv CANDIDATE_URL "$CANDIDATE_URL"
+          set_kv SUPER_ADMIN_EMAIL "$SUPER_ADMIN_EMAIL"
+          set_kv SUPER_ADMIN_PASSWORD "$SUPER_ADMIN_PASSWORD"
+          set_kv CLIENT_ADMIN_EMAIL "$CLIENT_ADMIN_EMAIL"
+          set_kv CLIENT_ADMIN_PASSWORD "$CLIENT_ADMIN_PASSWORD"
+
+          for key in API_URL SUPER_ADMIN_URL CLIENT_ADMIN_URL CANDIDATE_URL SUPER_ADMIN_EMAIL SUPER_ADMIN_PASSWORD; do
+            if grep -q "^${key}=$" .env; then
+              echo "::error::Missing required secret: ${key}"
+              exit 1
+            fi
+          done
+
+      - name: Run shared-project load test (gate)
+        run: |
+          set -o pipefail
+          RUN_LOG="${RUNNER_TEMP}/load-shared-run.log"
+          npm run load:shared \
+            NUM_CANDIDATES=${{ inputs.scale }} \
+            LOAD_VUS=${{ inputs.scale }} \
+            LOAD_MODE=load \
+            PERFORMANCE_PROFILE=${{ inputs.performance_profile }} \
+            LOAD_VU_START_INTERVAL_SECONDS=${{ inputs.vu_start_interval }} \
+            ${{ inputs.cleanup == 'false' && '--no-cleanup' || '' }} 2>&1 | tee "${RUN_LOG}"
+
+      - name: Report measured peak concurrency
+        if: always()
+        run: |
+          # Real peak of concurrently executing VUs — measured from WORK_START /
+          # WORK_END windows, not inferred from the ramp formula.
+          grep -E "PEAK_CONCURRENT_VUS=|\[peak\]" "${RUNNER_TEMP}/load-shared-run.log" \
+            || echo "peak telemetry not found in run log"
+
+      - name: Archive reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-shared-reports-${{ inputs.scale }}
+          path: reports/
+          if-no-files-found: ignore
