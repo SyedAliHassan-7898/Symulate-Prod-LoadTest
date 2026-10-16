@@ -31,7 +31,11 @@ symulate-load-tests/
 │   ├── run.js                          # Generic k6 runner with .env integration
 │   ├── run-shared-project-load.js      # 2-phase shared-project orchestrator
 │   ├── e2e-no-anum-full.js             # Playwright + k6 E2E automation
-│   ├── generate-csv-report.js          # Report generator
+│   ├── generate-csv-report.js          # 6-file CSV report generator
+│   ├── generate-professional-report.js # Professional HTML report
+│   ├── export-influxdb-data.js         # InfluxDB → CSV (JMeter summary + URLs)
+│   ├── report-utils.js                 # Shared report/naming helpers
+│   ├── failure-utils.js                # Per-request failure capture
 │   └── validate-project.js             # Environment validator
 │
 ├── 📁 scenarios/          # Reusable k6 scenario modules
@@ -42,10 +46,11 @@ symulate-load-tests/
 │   └── projectcreation.js              # Project lifecycle
 │
 ├── 📁 utils/              # Shared utilities & helpers
-│   ├── common.js                       # Shared logic across tests
-│   ├── http-client.js                  # HTTP wrapper with retries
-│   ├── websocket-client.js             # WebSocket handling
-│   └── ...more utilities
+│   ├── http.js                         # HTTP wrapper: retries, tags, failure capture
+│   ├── helpers.js                      # Shared logic (report naming, IDs)
+│   ├── routes.js                       # API route builders
+│   ├── socketConversation.js           # WebSocket conversation flow
+│   └── ...more utilities (data, cleanup, local-report, run-logger, webmAudio)
 │
 ├── 📁 data/               # Test data & fixtures
 │   ├── candidates.csv                  # Pre-defined candidate pool
@@ -698,7 +703,7 @@ start reports\symulate-report-*-url-details.csv
 **Professional HTML Report:**
 ```bat
 # Open comprehensive report in browser (Windows)
-start reports\PROFESSIONAL-*.html
+start reports\symulate-*.html
 ```
 
 ---
@@ -799,7 +804,7 @@ Recommendations:
 ### File Naming Convention
 
 ```
-PROFESSIONAL-{original-report-name}.html
+symulate-{original-report-name}.html
 ```
 
 **Example:**
@@ -807,7 +812,7 @@ PROFESSIONAL-{original-report-name}.html
 reports/
 ├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html  (k6 native)
 ├── shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json  (raw data)
-├── PROFESSIONAL-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html  ⭐
+├── symulate-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.html  ⭐
 ├── symulate-report-...-overview.csv
 ├── symulate-report-...-summary.csv
 ├── symulate-report-...-aggregate.csv
@@ -893,7 +898,7 @@ npm run smoke:grafana
 # Step 3: Open dashboard
 ```
 
-Access live dashboard: **http://localhost:3000** (admin/admin)
+Access live dashboard: **http://localhost:3001** (admin/admin)
 
 ### Available Grafana Commands
 
@@ -928,7 +933,7 @@ k6 Test Run
      ↓
 InfluxDB (port 8087)
      ↓
-Grafana Dashboard (port 3000)
+Grafana Dashboard (port 3001)
      ↓
 Real-time visualization
 ```
@@ -944,8 +949,8 @@ Real-time visualization
 npm run monitoring:status
 
 # Verify InfluxDB has data
-docker exec symulate-influxdb influx -execute "SHOW DATABASES"
-docker exec symulate-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"
+docker exec k6-influxdb influx -execute "SHOW DATABASES"
+docker exec k6-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"
 ```
 
 **Containers won't start?**
@@ -954,7 +959,7 @@ docker exec symulate-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"
 docker --version
 
 # Check ports are free
-netstat -an | findstr "3000 8087"
+netstat -an | findstr "3001 8087"
 
 # Reset everything
 npm run monitoring:reset
@@ -1086,16 +1091,20 @@ npm run load:shared
 - Oversized values (>4000 chars) written to temp files to avoid Windows ARG_MAX limits
 - All tests use same environment abstraction
 
-**3. WebSocket Handling (`utils/websocket-client.js`)**
+**3. WebSocket Handling (`utils/socketConversation.js`)**
 - Simulates real AI conversation flow
 - Staggered connection timing (prevents thundering herd)
 - Automatic reconnection with exponential backoff
 - Conversation state management per VU
 
-**4. Retry Logic (`utils/http-client.js`)**
+**4. HTTP Wrapper (`utils/http.js`)**
 - 429 rate limits: 3 retries with exponential backoff
 - Detailed logging shows which endpoint is rate-limited
 - Configurable via `HTTP_429_MAX_RETRIES` in .env
+- Tags every request with `name` **and full `url`** (stored in InfluxDB for URL-level reports)
+- Emits a structured `[FAILED_REQUEST] {json}` line per failed request
+  (status code + response-body message), which the runner scrapes into
+  `reports/failures-latest.json` for the HTML report's Failed Requests table
 
 **5. Rate Limit Management**
 - 65-second gaps between phases (global IP rate limit window)
