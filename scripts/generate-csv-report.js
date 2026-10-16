@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { reportsDir, loadLatestReport, metricValue, requestRows, checkRows, round } = require('./report-utils');
+const { reportsDir, loadLatestReport, metricValue, requestRows, checkRows, round, csvBaseNameFrom, stripReportPrefixes } = require('./report-utils');
 
 function csvEscape(value) {
   const text = value == null ? '' : String(value);
@@ -12,54 +12,172 @@ function writeCsv(filePath, rows) {
   fs.writeFileSync(filePath, `${body}\r\n`, 'utf8');
 }
 
+// Extract HTTP request details from metrics
+function extractHttpRequests(data) {
+  const rows = [];
+  const metrics = data.metrics || {};
+  
+  // k6 JSON summary captures `name` tag (endpoint labels) but not full URLs by default
+  // Full URLs would require custom tagging in k6 scripts or using --out csv during test
+  for (const [metricName, metric] of Object.entries(metrics)) {
+    const nameMatch = metricName.match(/^http_req_duration\{name:([^}]+)\}$/);
+    
+    if (nameMatch) {
+      const endpointName = nameMatch[1];
+      const samples = Math.round(metricValue(metric, 'count', 0));
+      
+      // Only add if there were actual requests
+      if (samples > 0) {
+        rows.push({
+          endpoint: endpointName,
+          samples: samples,
+          avg_ms: round(metricValue(metric, 'avg')),
+          median_ms: round(metricValue(metric, 'med')),
+          min_ms: round(metricValue(metric, 'min')),
+          max_ms: round(metricValue(metric, 'max')),
+          p90_ms: round(metricValue(metric, 'p(90)')),
+          p95_ms: round(metricValue(metric, 'p(95)')),
+          p99_ms: round(metricValue(metric, 'p(99)'))
+        });
+      }
+    }
+  }
+  
+  return rows.sort((a, b) => b.samples - a.samples);
+}
+
+// Extract complete metrics summary
+function extractMetricsSummary(data) {
+  const metrics = data.metrics || {};
+  const rows = [];
+  
+  const metricsToExtract = [
+    'http_reqs',
+    'http_req_failed',
+    'http_req_duration',
+    'http_req_blocked',
+    'http_req_connecting',
+    'http_req_sending',
+    'http_req_receiving',
+    'http_req_waiting',
+    'http_req_tls_handshaking',
+    'iterations',
+    'iteration_duration',
+    'vus',
+    'vus_max',
+    'data_received',
+    'data_sent',
+    'checks',
+    'ws_sessions',
+    'ws_msgs_sent',
+    'ws_msgs_received',
+    'ws_connecting',
+    'ws_session_duration'
+  ];
+  
+  for (const metricName of metricsToExtract) {
+    const metric = metrics[metricName];
+    if (!metric) continue;
+    
+    const values = metric.values || {};
+    rows.push({
+      metric: metricName,
+      count: round(values.count || 0),
+      rate: round((values.rate || 0) * 100, 4),
+      avg: round(values.avg || 0),
+      min: round(values.min || 0),
+      med: round(values.med || 0),
+      max: round(values.max || 0),
+      p90: round(values['p(90)'] || 0),
+      p95: round(values['p(95)'] || 0),
+      p99: round(values['p(99)'] || 0)
+    });
+  }
+  
+  return rows;
+}
+
 function main() {
   const { sourceReport, data } = loadLatestReport();
   const metrics = data.metrics || {};
-  const rows = requestRows(data);
-  const baseName = sourceReport.name.replace(/^report-/, 'symulate-report-').replace(/\.json$/i, '');
+  
+  // Validate that test has meaningful data (not just setup phase)
+  const totalRequests = metricValue(metrics.http_reqs, 'count');
+  const totalIterations = metricValue(metrics.iterations, 'count');
+  
+  if (totalRequests === 0 && totalIterations === 0) {
+    console.log('\n⚠️  Skipping CSV report generation:');
+    console.log(`   Test "${sourceReport.name}" has no HTTP requests or iterations.`);
+    console.log('   This appears to be a setup-only or empty test run.');
+    console.log('   CSV reports are generated only for tests with actual load data.\n');
+    process.exit(0);
+  }
+  
+  let rows = requestRows(data);
+  // Canonical CSV base per README: symulate-report-<base>. Strips any legacy
+  // prefix (report-/symulate-) so naming is consistent across every test.
+  const baseName = csvBaseNameFrom(sourceReport.name);
   const generatedAt = new Date().toISOString();
+
+  // Fallback: when no per-endpoint `name:` sub-metrics exist (e.g. setup runs
+  // or tests without name-tagged requests), emit a single global TOTAL row so
+  // summary/aggregate CSVs still carry real numbers instead of just headers.
+  if (rows.length === 0 && metricValue(metrics.http_reqs, 'count') > 0) {
+    const totalRequests = metricValue(metrics.http_reqs, 'count');
+    const durationSeconds = Math.max(metricValue(metrics.iteration_duration, 'avg') / 1000, 1);
+    const receivedKbSec = (metricValue(metrics.data_received, 'count') / 1024) / durationSeconds;
+    const sentKbSec = (metricValue(metrics.data_sent, 'count') / 1024) / durationSeconds;
+    rows = [{
+      label: 'TOTAL',
+      samples: Math.round(totalRequests),
+      average: round(metricValue(metrics.http_req_duration, 'avg')),
+      median: round(metricValue(metrics.http_req_duration, 'med')),
+      p90: round(metricValue(metrics.http_req_duration, 'p(90)')),
+      p95: round(metricValue(metrics.http_req_duration, 'p(95)')),
+      p99: round(metricValue(metrics.http_req_duration, 'p(99)')),
+      min: round(metricValue(metrics.http_req_duration, 'min')),
+      max: round(metricValue(metrics.http_req_duration, 'max')),
+      stddev: round(metricValue(metrics.http_req_duration, 'stddev')),
+      errorRate: round(metricValue(metrics.http_req_failed, 'rate') * 100, 4),
+      throughput: round(totalRequests / durationSeconds, 5),
+      receivedKbSec: round(receivedKbSec, 2),
+      sentKbSec: round(sentKbSec, 2),
+      avgBytes: round(metricValue(metrics.data_received, 'count') / totalRequests, 1)
+    }];
+  }
 
   const overviewPath = path.join(reportsDir, `${baseName}-overview.csv`);
   const summaryPath = path.join(reportsDir, `${baseName}-summary.csv`);
   const aggregatePath = path.join(reportsDir, `${baseName}-aggregate.csv`);
   const checksPath = path.join(reportsDir, `${baseName}-checks.csv`);
+  const urlDetailsPath = path.join(reportsDir, `${baseName}-url-details.csv`);
+  const metricsPath = path.join(reportsDir, `${baseName}-all-metrics.csv`);
 
-  const checksMetric = metrics.checks || {};
-
-  const overviewRows = [
+  // Overview CSV
+  writeCsv(overviewPath, [
     ['Metric', 'Value'],
     ['Report Type', 'Symulate Load Test Report'],
     ['Source JSON', sourceReport.name],
     ['Generated At', generatedAt],
-    ['Test Name', baseName.replace(/^symulate-report-/, '')],
+    ['Test Name', stripReportPrefixes(sourceReport.name)],
     ['Total Requests', metricValue(metrics.http_reqs, 'count')],
-    ['Failed Requests', metricValue(metrics.http_req_failed, 'count')],
+    ['Failed Requests', Math.round(metricValue(metrics.http_req_failed, 'rate') * metricValue(metrics.http_reqs, 'count'))],
     ['Failed Request %', round(metricValue(metrics.http_req_failed, 'rate') * 100, 4)],
-    ['Total Checks', round(metricValue(checksMetric, 'passes') + metricValue(checksMetric, 'fails'))],
+    ['Total Checks', (metricValue(metrics.checks, 'count') || 0)],
     ['Checks Passed %', round(metricValue(metrics.checks, 'rate') * 100, 2)],
     ['Total Iterations', metricValue(metrics.iterations, 'count')],
-    ['Total VUs', round(metricValue(metrics.vus, 'max') || metricValue(metrics.vus_max, 'max'))],
+    ['Total VUs', metricValue(metrics.vus_max, 'max')],
     ['Avg Response Time (ms)', round(metricValue(metrics.http_req_duration, 'avg'))],
     ['P95 Response Time (ms)', round(metricValue(metrics.http_req_duration, 'p(95)'))],
     ['P99 Response Time (ms)', round(metricValue(metrics.http_req_duration, 'p(99)'))],
-    ['Total Data Received (bytes)', round(metricValue(metrics.data_received, 'count'))],
-    ['Total Data Sent (bytes)', round(metricValue(metrics.data_sent, 'count') || metricValue(metrics.sent_bytes, 'count'))]
-  ];
+    ['Total Data Received (bytes)', metricValue(metrics.data_received, 'count')],
+    ['Total Data Sent (bytes)', metricValue(metrics.data_sent, 'count')],
+    ['WebSocket Sessions', metricValue(metrics.ws_sessions, 'count') || 0],
+    ['WS Messages Sent', metricValue(metrics.ws_msgs_sent, 'count') || 0],
+    ['WS Messages Received', metricValue(metrics.ws_msgs_received, 'count') || 0]
+  ]);
 
-  // WebSocket rows only when the run actually opened sockets — an empty row
-  // would otherwise read as "zero sessions" instead of "not applicable".
-  [
-    ['WebSocket Sessions', 'ws_sessions'],
-    ['WS Messages Sent', 'ws_msgs_sent'],
-    ['WS Messages Received', 'ws_msgs_received']
-  ].forEach(([label, metricName]) => {
-    if (metrics[metricName]) {
-      overviewRows.push([label, round(metricValue(metrics[metricName], 'count') || metricValue(metrics[metricName], 'max'))]);
-    }
-  });
-
-  writeCsv(overviewPath, overviewRows);
-
+  // Summary CSV (JMeter-style)
   writeCsv(summaryPath, [
     ['Label', '# Samples', 'Average', 'Min', 'Max', 'Std. Dev.', 'Error %', 'Throughput', 'Received KB/sec', 'Sent KB/sec', 'Avg. Bytes'],
     ...rows.map((row) => [
@@ -77,6 +195,7 @@ function main() {
     ])
   ]);
 
+  // Aggregate CSV (with percentiles)
   writeCsv(aggregatePath, [
     ['Label', '# Samples', 'Average', 'Median', '90% Line', '95% Line', '99% Line', 'Min', 'Max', 'Error %', 'Throughput', 'Received KB/sec', 'Sent KB/sec'],
     ...rows.map((row) => [
@@ -96,22 +215,56 @@ function main() {
     ])
   ]);
 
+  // Checks CSV
   writeCsv(checksPath, [
     ['Group', 'Check', 'Passes', 'Fails', 'Pass %'],
     ...checkRows(data).map((row) => [row.group, row.check, row.passes, row.fails, row.passRate])
   ]);
 
-  // url-details.csv — "which endpoints were hit, and how fast".
-  // The README documented this file long before the generator produced it.
-  const urlDetailsPath = path.join(reportsDir, `${baseName}-url-details.csv`);
+  // URL Details CSV
+  // Note: k6 captures endpoint labels (name tags) not full URLs in JSON summary
+  // For full URLs, use --out csv=file.csv during test execution
+  let urlDetails = extractHttpRequests(data);
+  // Fallback: no per-endpoint `name:` sub-metrics → emit a global TOTAL row.
+  if (urlDetails.length === 0 && metricValue(metrics.http_reqs, 'count') > 0) {
+    urlDetails = [{
+      endpoint: 'TOTAL',
+      samples: Math.round(metricValue(metrics.http_reqs, 'count')),
+      avg_ms: round(metricValue(metrics.http_req_duration, 'avg')),
+      median_ms: round(metricValue(metrics.http_req_duration, 'med')),
+      min_ms: round(metricValue(metrics.http_req_duration, 'min')),
+      max_ms: round(metricValue(metrics.http_req_duration, 'max')),
+      p90_ms: round(metricValue(metrics.http_req_duration, 'p(90)')),
+      p95_ms: round(metricValue(metrics.http_req_duration, 'p(95)')),
+      p99_ms: round(metricValue(metrics.http_req_duration, 'p(99)'))
+    }];
+  }
   writeCsv(urlDetailsPath, [
-    ['URL/Endpoint', '# Requests', 'Avg (ms)', 'Median (ms)', 'Min (ms)', 'Max (ms)', 'P90 (ms)', 'P95 (ms)', 'P99 (ms)'],
-    ...rows.map((row) => [
-      row.label,
+    ['API Endpoint / Operation', '# Requests', 'Avg (ms)', 'Median (ms)', 'Min (ms)', 'Max (ms)', 'P90 (ms)', 'P95 (ms)', 'P99 (ms)'],
+    ...urlDetails.map((row) => [
+      row.endpoint,
       row.samples,
-      row.average,
-      row.median,
+      row.avg_ms,
+      row.median_ms,
+      row.min_ms,
+      row.max_ms,
+      row.p90_ms,
+      row.p95_ms,
+      row.p99_ms
+    ])
+  ]);
+
+  // All Metrics CSV (NEW!)
+  const allMetrics = extractMetricsSummary(data);
+  writeCsv(metricsPath, [
+    ['Metric Name', 'Count', 'Rate (%)', 'Avg', 'Min', 'Median', 'Max', 'P90', 'P95', 'P99'],
+    ...allMetrics.map((row) => [
+      row.metric,
+      row.count,
+      row.rate,
+      row.avg,
       row.min,
+      row.med,
       row.max,
       row.p90,
       row.p95,
@@ -119,34 +272,14 @@ function main() {
     ])
   ]);
 
-  // all-metrics.csv — every metric k6 emitted, one row each. Useful as the
-  // raw artifact a run-over-run diff can be built on.
-  const allMetricsPath = path.join(reportsDir, `${baseName}-all-metrics.csv`);
-  writeCsv(allMetricsPath, [
-    ['Metric Name', 'Count', 'Rate (%)', 'Avg', 'Min', 'Median', 'Max', 'P90', 'P95', 'P99'],
-    ...Object.entries(metrics)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([name, metric]) => [
-        name,
-        round(metricValue(metric, 'count')),
-        round(metricValue(metric, 'rate') * 100, 4),
-        round(metricValue(metric, 'avg')),
-        round(metricValue(metric, 'min')),
-        round(metricValue(metric, 'med')),
-        round(metricValue(metric, 'max')),
-        round(metricValue(metric, 'p(90)')),
-        round(metricValue(metric, 'p(95)')),
-        round(metricValue(metric, 'p(99)'))
-      ])
-  ]);
-
   console.log(`CSV reports generated:`);
-  console.log(`- ${overviewPath}`);
-  console.log(`- ${summaryPath}`);
-  console.log(`- ${aggregatePath}`);
-  console.log(`- ${checksPath}`);
-  console.log(`- ${urlDetailsPath}`);
-  console.log(`- ${allMetricsPath}`);
+  console.log(`  ✓ ${path.basename(overviewPath)}`);
+  console.log(`  ✓ ${path.basename(summaryPath)}`);
+  console.log(`  ✓ ${path.basename(aggregatePath)}`);
+  console.log(`  ✓ ${path.basename(checksPath)}`);
+  console.log(`  ✓ ${path.basename(urlDetailsPath)} (NEW - URL details)`);
+  console.log(`  ✓ ${path.basename(metricsPath)} (NEW - All metrics)`);
+  console.log(`\nAll reports saved to: ${reportsDir}`);
 }
 
 main();

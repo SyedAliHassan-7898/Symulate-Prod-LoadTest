@@ -24,6 +24,60 @@ function recordBytes(res, name) {
   sentBytes.add(sent, { name });
 }
 
+// ── Per-request failure capture ─────────────────────────────────────────────
+// k6's summary JSON only carries the AGGREGATED http_req_failed rate — never
+// the per-request status code or the response-body error message. The runner
+// surfaces those by scraping the structured [FAILED_REQUEST] lines we emit here
+// (see scripts/run.js and scripts/run-shared-project-load.js), which then land
+// in reports/failures-latest.json and are rendered in the HTML report.
+
+function isFailed(res) {
+  if (!res) return true;
+  if (res.error) return true; // network/protocol error (timeout, reset, ...)
+  return typeof res.status === 'number' && res.status >= 400;
+}
+
+// Pull a short human-readable message out of a failed response: prefer a JSON
+// body's message/error field, else the raw (truncated) body, else the network
+// error text.
+function failureMessage(res) {
+  if (!res) return 'No response received';
+  if (res.error) return `Network error: ${res.error}${res.error_code ? ` (code ${res.error_code})` : ''}`;
+  const body = res.body;
+  if (body == null || body === '') return `HTTP ${res.status} with empty body`;
+  const text = typeof body === 'string' ? body : String(body);
+  try {
+    const parsed = JSON.parse(text);
+    const msg = parsed.message || parsed.error || parsed.msg || parsed.title ||
+      (parsed.errors && (Array.isArray(parsed.errors) ? parsed.errors.join('; ') : String(parsed.errors)));
+    if (msg) return typeof msg === 'string' ? msg : JSON.stringify(msg);
+  } catch (e) { /* not JSON — fall through to raw text */ }
+  return text.length > 300 ? `${text.slice(0, 300)}…` : text;
+}
+
+// Emit one structured line per failed request. The runner parses the JSON that
+// follows the marker. Method is passed explicitly so the report can show it.
+function reportFailure(res, name, url, method) {
+  if (!isFailed(res)) return;
+  const payload = {
+    name: name || '',
+    method: method || '',
+    url: url || '',
+    status: res && typeof res.status === 'number' ? res.status : 0,
+    errorCode: (res && res.error_code) || 0,
+    message: failureMessage(res),
+    at: new Date().toISOString()
+  };
+  console.log(`[FAILED_REQUEST] ${JSON.stringify(payload)}`);
+}
+
+// Shared tail for every wrapper: count bytes + capture failures in one place.
+function finish(res, name, url, method) {
+  recordBytes(res, name);
+  reportFailure(res, name, url, method);
+  return res;
+}
+
 function headers(token, extra = {}) {
   const base = { 'Content-Type': 'application/json' };
   if (token) base.Authorization = `Bearer ${token}`;
@@ -107,65 +161,58 @@ function requestWithRetry(fn, name, url) {
 
 export function getJson(url, token, name) {
   const res = requestWithRetry(
-    () => http.get(url, { headers: headers(token), tags: { name } }),
+    () => http.get(url, { headers: headers(token), tags: { name, url } }),
     name, url
   );
-  recordBytes(res, name);
-  return res;
+  return finish(res, name, url, 'GET');
 }
 
 export function getJsonWithHeaders(url, token, name, extraHeaders = {}) {
   const res = requestWithRetry(
-    () => http.get(url, { headers: headers(token, extraHeaders), tags: { name } }),
+    () => http.get(url, { headers: headers(token, extraHeaders), tags: { name, url } }),
     name, url
   );
-  recordBytes(res, name);
-  return res;
+  return finish(res, name, url, 'GET');
 }
 
 export function postJson(url, body, token, name) {
   const res = requestWithRetry(
-    () => http.post(url, JSON.stringify(body), { headers: headers(token), tags: { name } }),
+    () => http.post(url, JSON.stringify(body), { headers: headers(token), tags: { name, url } }),
     name, url
   );
-  recordBytes(res, name);
-  return res;
+  return finish(res, name, url, 'POST');
 }
 
 export function postJsonWithHeaders(url, body, token, name, extraHeaders = {}) {
   const res = requestWithRetry(
-    () => http.post(url, JSON.stringify(body), { headers: headers(token, extraHeaders), tags: { name } }),
+    () => http.post(url, JSON.stringify(body), { headers: headers(token, extraHeaders), tags: { name, url } }),
     name, url
   );
-  recordBytes(res, name);
-  return res;
+  return finish(res, name, url, 'POST');
 }
 
 export function patchJson(url, body, token, name) {
   const res = requestWithRetry(
-    () => http.patch(url, JSON.stringify(body), { headers: headers(token), tags: { name } }),
+    () => http.patch(url, JSON.stringify(body), { headers: headers(token), tags: { name, url } }),
     name, url
   );
-  recordBytes(res, name);
-  return res;
+  return finish(res, name, url, 'PATCH');
 }
 
 export function patchJsonWithHeaders(url, body, token, name, extraHeaders = {}) {
   const res = requestWithRetry(
-    () => http.patch(url, JSON.stringify(body), { headers: headers(token, extraHeaders), tags: { name } }),
+    () => http.patch(url, JSON.stringify(body), { headers: headers(token, extraHeaders), tags: { name, url } }),
     name, url
   );
-  recordBytes(res, name);
-  return res;
+  return finish(res, name, url, 'PATCH');
 }
 
 export function postMultipart(url, fields, token, name) {
   const res = requestWithRetry(
-    () => http.post(url, fields, { headers: headers(token, { 'Content-Type': undefined }), tags: { name } }),
+    () => http.post(url, fields, { headers: headers(token, { 'Content-Type': undefined }), tags: { name, url } }),
     name, url
   );
-  recordBytes(res, name);
-  return res;
+  return finish(res, name, url, 'POST');
 }
 
 // Safely pulls a token out of a few common response shapes, so the suite

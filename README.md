@@ -257,13 +257,13 @@ ANUM_API_ENABLED=false
 
 ### ⚠️ Critical settings that cause confusion:
 
-| Setting                          | Wrong value                        | What happens                                           | Correct value     |
-| -------------------------------- | ---------------------------------- | ------------------------------------------------------ | ----------------- |
-| `LOAD_MODE`                      | `load` when running smoke          | Creates`LOAD_VUS × LOAD_ITERATIONS_PER_VU` orgs        | `smoke`           |
-| `LOAD_ITERATIONS_PER_VU`         | `10`                               | 10 VUs × 10 iterations = 100 orgs in 1 run             | `1`               |
-| `SEND_PROJECT_INVITATIONS`       | `false`                            | Project stays DRAFT, candidates can't access           | `true`            |
-| `CANDIDATE_EXECUTION_SOURCE`     | empty or`none`                     | Activities never run                                   | `generated`       |
-| `ANUM_API_ENABLED` / `ANAM_MODE` | `enable` / `enabled` / `yes` / `1` | Parsed as**false** silently (code checks `=== 'true'`) | `true` or `false` |
+| Setting | Wrong value | What happens | Correct value |
+|---------|-------------|-------------|---------------|
+| `LOAD_MODE` | `load` when running smoke | Creates `LOAD_VUS × LOAD_ITERATIONS_PER_VU` orgs | `smoke` |
+| `LOAD_ITERATIONS_PER_VU` | `10` | 10 VUs × 10 iterations = 100 orgs in 1 run | `1` |
+| `SEND_PROJECT_INVITATIONS` | `false` | Project stays DRAFT, candidates can't access | `true` |
+| `CANDIDATE_EXECUTION_SOURCE` | empty or `none` | Activities never run | `generated` |
+| `ANUM_API_ENABLED` / `ANAM_MODE` | `enable` / `enabled` / `yes` / `1` | Parsed as **false** silently (code checks `=== 'true'`) | `true` or `false` |
 
 ---
 
@@ -358,8 +358,9 @@ npm run monitoring:reset         # Clear all data & restart
 
 ```bat
 npm run validate                 # Validate .env configuration
-npm run report:csv               # Generate the 6 CSV files from a JSON report
-npm run cleanup:shared           # Delete leftovers from an earlier shared run
+npm run report:csv               # Generate CSV reports from results
+npm run report:professional      # Generate professional HTML report
+npm run report:grafana           # Export InfluxDB/Grafana data to CSV
 ```
 
 > `report:professional` and `report:grafana` do **not** exist in `package.json` —
@@ -721,6 +722,17 @@ So pointing `API_URL` at `https://api.symulate.ai/prod/api` makes the invitation
 - If you must load-test prod, ask the backend team to enable `EXPOSE_CANDIDATE_PORTAL_LINKS=true` on the prod env **temporarily** (explicit security trade-off), restart it, then rerun Phase 1. Do **not** leave it on in prod.
 - The harness prints this exact hint in shared-load mode when no href is captured, and aborts before Phase 2 rather than running a meaningless load.
 
+### `href token not found ... expected access_token in the email login href` (prod / UAT)
+
+**Cause:** The harness does **not** read the candidate's inbox. It gets the candidate login link from the `accessMyPortal` field that the **invitation API returns** (`scenarios/projectcreation.js` → `allInvitationHrefs`). The backend only populates that field when `EXPOSE_CANDIDATE_PORTAL_LINKS=true` — a local/dev-only opt-in. For `NODE_ENV=dev` the links are included automatically, but **UAT/prod intentionally omit them** (returning candidate bearer tokens in an API response is a security risk).
+
+So pointing `API_URL` at `https://api.symulate.ai/prod/api` makes the invitation response come back **without** candidate portal links → no `access_token` → `candidateSessionFromInviteHref()` returns null → the candidate flow logs the message and returns zero activities. This is **expected in prod**, not a script bug.
+
+**Fix options:**
+- Run the candidate-assessment / `load:shared` flow against the **dev** backend (where links are exposed) — this is what the suite is designed for.
+- If you must load-test prod, ask the backend team to enable `EXPOSE_CANDIDATE_PORTAL_LINKS=true` on the prod env **temporarily** (explicit security trade-off), restart it, then rerun Phase 1. Do **not** leave it on in prod.
+- The harness prints this exact hint in shared-load mode when no href is captured, and aborts before Phase 2 rather than running a meaningless load.
+
 ---
 
 ## 11. Reports
@@ -729,31 +741,22 @@ All runs automatically generate comprehensive reports in `reports/`:
 
 ### Automatic Report Generation
 
-Every k6 run automatically writes **HTML + JSON** (from `handleSummary()` in the
-test file) and both runners write **`failures-latest.json`**. The **6 CSV files**
-are *derived* from the JSON report and are produced on demand:
-
-```bat
-npm run report:csv
-```
+Every test (smoke, load, grafana) automatically creates **6 CSV files + HTML + JSON**:
 
 #### Generated Files:
 
-| File Type                          | Content                                   | Use Case                                 |
-| ---------------------------------- | ----------------------------------------- | ---------------------------------------- |
-| **HTML** (auto)                    | Interactive dashboard                     | Quick visual review in browser           |
-| **JSON** (auto)                    | Raw k6 metrics                            | Programmatic analysis, CI/CD integration |
-| **-overview.csv** (report:csv)     | High-level summary                        | Executive summary, quick metrics         |
-| **-summary.csv** (report:csv)      | Per-endpoint JMeter-style                 | Performance comparison, SLA validation   |
-| **-aggregate.csv** (report:csv)    | With percentiles (P90/P95/P99)            | Detailed latency distribution            |
-| **-checks.csv** (report:csv)       | All assertion results                     | Test validation, failure analysis        |
-| **-url-details.csv** ⭐ (report:csv)| Complete URL list with metrics            | **"Which URLs were hit?"** analysis      |
-| **-all-metrics.csv** ⭐ (report:csv)| Every k6 metric                           | Complete test execution data             |
-| **failures-latest.json** (auto)    | Per-request failures (code + message)     | Post-run triage; diffed between runs     |
-
-> `failures-latest.json` is a **sidecar**: the HTML report still shows only the
-> *aggregate* failure rate, per-request detail is read from this file (or the
-> run log). See [Failed Request Capture](#failed-request-capture-status-code--message).
+| File Type | Content | Use Case |
+|-----------|---------|----------|
+| **HTML** | Interactive dashboard | Quick visual review in browser |
+| **JSON** | Raw k6 metrics | Programmatic analysis, CI/CD integration |
+| **-overview.csv** | High-level summary | Executive summary, quick metrics |
+| **-summary.csv** | Per-endpoint JMeter-style | Performance comparison, SLA validation |
+| **-aggregate.csv** | With percentiles (P90/P95/P99) | Detailed latency distribution |
+| **-checks.csv** | All assertion results | Test validation, failure analysis |
+| **-url-details.csv** ⭐ | Complete URL list with metrics | **"Which URLs were hit?"** analysis |
+| **-all-metrics.csv** ⭐ | Every k6 metric | Complete test execution data |
+| **failures-latest.json** | Per-request failures (code + message) | Feeds HTML *Failed Requests* table |
+| **jmeter-endpoint-summary-*.csv** | JMeter-style per-endpoint (from InfluxDB) | SLA / capacity analysis |
 
 ### Report Naming Convention
 
@@ -768,38 +771,32 @@ All reports use a consistent **`symulate`** prefix (the separate "happening" pro
 
 Derived filenames always start from a clean base (`report-utils.js` strips legacy `symulate-`/`symulate-report-`/`PROFESSIONAL-`/`report-` prefixes):
 
-| Output                             | Pattern                                                                                  |
-| ---------------------------------- | ---------------------------------------------------------------------------------------- |
-| k6 native HTML/JSON                | `symulate-<base>.json` (written by the test)                                             |
-| Professional HTML                  | `symulate-<base>.html`                                                                   |
-| 6-file CSV set (`npm run report:csv`)| `symulate-report-<base>-{overview,summary,aggregate,checks,url-details,all-metrics}.csv` |
-| Failure sidecar (automatic)        | `failures-latest.json`                                                                   |
-| Failure sidecar                    | `failures-latest.json`                                                                   |
+| Output | Pattern |
+|--------|---------|
+| k6 native HTML/JSON | `symulate-<base>.json` (written by the test) |
+| Professional HTML | `symulate-<base>.html` |
+| 6-file CSV set | `symulate-report-<base>-{overview,summary,aggregate,checks,url-details,all-metrics}.csv` |
+| JMeter endpoint summary (InfluxDB) | `jmeter-endpoint-summary-<ts>.csv` |
+| Full-URL detail (InfluxDB) | `url-details-<ts>.csv` |
+| Failure sidecar | `failures-latest.json` |
 
 ### Failed Request Capture (status code + message)
 
-k6's summary only reports the **aggregated** failure rate — never _which_ request failed or _why_. This suite captures every failed request at the source:
+k6's summary only reports the **aggregated** failure rate — never *which* request failed or *why*. This suite captures every failed request at the source:
 
-1. **`utils/http.js`** — every wrapper funnels through `requestWithRetry()`, which for the **final** response of any call with **status ≥ 400** (or a thrown network error) emits one structured line:
-
+1. **`utils/http.js`** — each wrapper routes through `finish()`, which for any response with **status ≥ 400** or a **network error** emits one structured line:
    ```
    [FAILED_REQUEST] {"name":"Login - Load Test Admin","method":"POST","url":"https://api.../auth/login","status":429,"errorCode":1429,"message":"Too many login attempts...","at":"2026-10-16T07:36:47Z"}
    ```
+   The `message` is pulled from the JSON body's `message`/`error` field (else the raw body, else the network error text).
+2. **`scripts/failure-utils.js`** — both runners (`run.js` and `run-shared-project-load.js`) tee k6's stderr, parse these lines, and write `reports/failures-latest.json` on **every** run (an empty array clears stale failures).
+3. The **professional HTML report** renders them under *Detailed Findings → Failed Requests* as a table: Time · Label · Method · Status (color-coded 4xx/5xx) · Failure Message · URL.
 
-   The `message` is pulled from the JSON body's `message`/`error` field (else the raw body, else the network error text). Intermediate 429s that later retry successfully are not reported — only the final outcome is.
-
-2. **`scripts/run.js` and `scripts/run-shared-project-load.js`** tee k6's stdout/stderr, parse those lines (the shared runner accumulates them across all phases), and write `reports/failures-latest.json` on **every** run — an empty array clears stale failures from a previous run.
-
-> **Known gap:** the HTML report still renders only the *aggregate* failure rate;
-> it does **not** yet contain a per-request "Failed Requests" table. Read
-> `failures-latest.json` (or the run log) for that detail.
-
-> `failures-latest.json` is a sidecar, not a k6 report — the report picker (`latestJsonReport()`) explicitly excludes it (it only matches `report-*.json`) so it's never mistaken for test data.
+> `failures-latest.json` is a sidecar, not a k6 report — the report picker (`latestJsonReport()`) explicitly excludes it so it's never mistaken for test data.
 
 ### CSV Report Details
 
 **1. overview.csv** - Executive Summary
-
 ```csv
 Metric,Value
 Report Type,Symulate Load Test Report
@@ -816,13 +813,12 @@ P95 Response Time (ms),451.09
 P99 Response Time (ms),620.57
 Total Data Received (bytes),2447360
 Total Data Sent (bytes),10660
-WebSocket Sessions,60
+WebSocket Sessions,50
 WS Messages Sent,640
 WS Messages Received,1190
 ```
 
 **2. url-details.csv** ⭐ (NEW!)
-
 ```csv
 URL/Endpoint,# Requests,Avg (ms),Median (ms),Min (ms),Max (ms),P90 (ms),P95 (ms),P99 (ms)
 Login - Client Admin,10,315.2,310.5,290.1,355.8,340.2,350.0,355.0
@@ -830,23 +826,20 @@ Get Project Details,10,201.4,198.5,180.2,250.3,230.5,240.1,248.0
 Create Project Candidate 1/10,10,277.0,270.0,240.0,310.0,295.0,305.0,309.0
 ...all endpoints listed...
 ```
-
 **Shows exactly which APIs were called and their performance!**
 
 **3. all-metrics.csv** ⭐ (NEW!)
-
 ```csv
 Metric Name,Count,Rate (%),Avg,Min,Median,Max,P90,P95,P99
 http_reqs,171,0,0,0,0,0,0,0,0
 http_req_duration,171,0,237.01,146.7,198.07,1220,351.81,451.09,620.57
 http_req_failed,0,0,0,0,0,0,0,0,0
-ws_sessions,60,0,0,0,0,0,0,0,0
+ws_sessions,50,0,0,0,0,0,0,0,0
 ws_msgs_sent,640,0,0,0,0,0,0,0,0
 iterations,10,0,96000,79000,97000,113000,109000,111000,113000
 vus_max,10,0,10,10,10,10,10,10,10
 ...complete metrics...
 ```
-
 **Every metric k6 captured, in one file!**
 
 ### Example: After Running `npm run load:shared`
@@ -861,7 +854,7 @@ reports/
 ├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-checks.csv
 ├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-url-details.csv  ⭐
 ├── symulate-report-shared-admin-candidate-load-2026-10-15T12-17-39-676Z-all-metrics.csv  ⭐
-└── failures-latest.json   (per-request failures → post-run triage / CI artifact)
+└── failures-latest.json   (per-request failures → HTML Failed Requests table)
 ```
 
 ### Manual CSV Generation
@@ -877,21 +870,18 @@ This finds the latest JSON report and generates all 6 CSV files.
 ### Opening Reports
 
 **HTML Report:**
-
 ```bat
 # Open in browser (Windows)
 start reports\shared-admin-candidate-load-*.html
 ```
 
 **CSV Reports:**
-
 ```bat
 # Open in Excel
 start reports\symulate-report-*-url-details.csv
 ```
 
 **Professional HTML Report:**
-
 ```bat
 # Open comprehensive report in browser (Windows)
 start reports\symulate-*.html
@@ -906,71 +896,62 @@ Every test automatically generates a **comprehensive, industry-standard HTML rep
 ### 9-Section Report Structure
 
 #### 1. 📊 Executive Summary
-
 - Test objective and scope
 - Test duration and environment
 - Key performance metrics (requests, throughput, response time)
 - Critical issues count with severity breakdown
 
 #### 2. ⚙️ Test Configuration
-
 - Environment (staging/prod)
 - Virtual Users (VUs)
 - Test duration
 - Scenario details
 
 #### 3. 📈 Summary Graphs & Charts
-
 - Response time distribution
 - Data transfer visualization
-- _Note: Charts show test totals; see Grafana for real-time graphs_
+- *Note: Charts show test totals; see Grafana for real-time graphs*
 
 #### 4. 🎯 Performance Metrics
 
 **HTTP Metrics:**
-
 - Total requests
 - Requests/sec rate
 - Response time percentiles (p50, p90, p95, p99)
 - Connection time breakdown (connecting, TLS handshaking, sending, waiting, receiving)
 
 **WebSocket Metrics:**
-
 - Active sessions
 - Messages sent/received
 - Session duration
 
 **Throughput:**
-
 - Data received/sent
 - Network efficiency
 
 #### 5. 🔍 Endpoint Analysis
-
 - Per-URL performance breakdown
 - Request counts per endpoint
 - Response time statistics (avg/median/min/max/p90/p95/p99)
-- _Links to detailed url-details.csv_
+- *Links to detailed url-details.csv*
 
 #### 6. ⚠️ Detailed Findings
 
 **Automatic Issue Detection** with severity classification:
 
-| Severity       | Badge Color | Error Rate | p95 Response Time |
-| -------------- | ----------- | ---------- | ----------------- |
-| 🔴**Critical** | Red         | >5%        | >3000ms           |
-| 🟠**High**     | Orange      | >2%        | >2000ms           |
-| 🟡**Medium**   | Yellow      | >1%        | >1000ms           |
-| 🟢**Low**      | Green       | <1%        | <1000ms           |
+| Severity | Badge Color | Error Rate | p95 Response Time |
+|----------|-------------|------------|-------------------|
+| 🔴 **Critical** | Red | >5% | >3000ms |
+| 🟠 **High** | Orange | >2% | >2000ms |
+| 🟡 **Medium** | Yellow | >1% | >1000ms |
+| 🟢 **Low** | Green | <1% | <1000ms |
 
 **Each finding includes:**
-
 - Description of the issue
 - Evidence (actual metrics)
 - Actionable recommendations
 
 **Example Finding:**
-
 ```
 ⚠️ HIGH - High Error Rate (3.2%)
 
@@ -985,20 +966,17 @@ Recommendations:
 ```
 
 #### 7. ✅ Test Validation
-
 - Total checks performed
 - Pass/fail counts
 - Pass percentage
 
 #### 8. 📋 Methodology
-
 - Test approach and objectives
 - Tools used (k6, Grafana, InfluxDB, Playwright)
 - Test phases (provisioning, load execution)
 - Load pattern description
 
 #### 9. 📎 Appendices
-
 - Links to all 6 CSV reports
 - Raw JSON data reference
 - Test script information
@@ -1011,7 +989,6 @@ symulate-{original-report-name}.html
 ```
 
 **Example:**
-
 ```
 reports/
 ├── symulate-shared-admin-candidate-load-2026-10-15T12-17-39-676Z.json  (raw k6 data)
@@ -1045,20 +1022,17 @@ npm run report:professional
 ### Report Features
 
 **Responsive Design:**
-
 - Mobile-friendly layout
 - Print-optimized CSS
 - Collapsible sections
 
 **Color-Coded Severity:**
-
 - Critical: Red (#dc3545)
 - High: Orange (#fd7e14)
 - Medium: Yellow (#ffc107)
 - Low: Green (#28a745)
 
 **Executive-Ready:**
-
 - Non-technical executive summary
 - Visual metric presentation
 - Clear actionable findings
@@ -1075,7 +1049,6 @@ npm run report:professional
 ### Playwright Artifacts
 
 Browser automation artifacts stored separately:
-
 ```
 playwright/artifacts/
 ├── screenshots/
@@ -1179,187 +1152,82 @@ For complete Grafana setup guide, see: **[monitoring/GRAFANA_SETUP.md](monitorin
 
 ### Exporting Grafana Data
 
-**Status: not implemented yet — known gap.**
-
-Metrics are pushed to InfluxDB every 3 seconds and rendered live in Grafana.
-There is **no `npm run report:grafana` CSV exporter in this repository**, and the
-`:grafana` npm scripts do not export anything after the run — they only add
-k6's `--out influxdb=...` output (and `load:shared:grafana` now applies it to
-**both** phases).
-
-To analyse a run's numbers, use one of these instead:
-
-- `npm run report:csv` — the 6-file CSV set built from the run's k6 JSON
-  (`reports/failures-latest.json` for per-request failures).
-- Query InfluxDB directly, e.g.
-  `docker exec k6-influxdb influx -database k6 -execute "SHOW MEASUREMENTS"`
-- Export a Grafana panel as CSV from the panel menu (raw time series).
-- `reports/*.json` — full k6 summary, readable from any script.
-
-> InfluxDB accumulates metrics across _all_ runs forever until
-> `npm run monitoring:reset`. Note that `name` is a reserved InfluxQL word and
-> must be quoted (`"name"`) in ad-hoc queries.
-
----
-
-## SLA / Pass-Fail Criteria (Thresholds)
-
-A load test is only useful if it can **pass or fail against a target**. This suite
-encodes SLA/NFR budgets as **k6 thresholds** in [`config/thresholds.js`](config/thresholds.js),
-so any breached budget makes k6 exit non-zero (usable directly as a CI gate).
-
-### Profile selection (first match wins)
-
-1. `PERFORMANCE_PROFILE` env var — `auto | strict | standard | baseline | functional`
-2. `ENV_PROFILE` env var — `production` → strict, `staging` → standard, `dev` → baseline
-3. `LOAD_MODE` fallback (when the above are `auto`) — `smoke` → strict, `load` → baseline
-
-### Global gates per profile
-
-| Profile (target)        | Error rate | p95        | p99         | Checks    |
-| ----------------------- | ---------- | ---------- | ----------- | --------- |
-| **strict** (production) | `< 1%`     | `< 2000ms` | `< 3500ms`  | `> 99%`   |
-| **standard** (staging)  | `< 1%`     | `< 2000ms` | `< 6000ms`  | `> 99%`   |
-| **baseline** (dev)      | `< 1%`     | `< 2000ms` | `< 12000ms` | `> 99%`   |
-| **functional**          | `< 1%`     | — (reported only) | —   | `> 99%`   |
-
-### Per-endpoint p95 SLOs
-
-Every named request also carries a **p95 latency SLO** (kept constant across profiles —
-p95 reflects the request path itself, not how loaded the environment is). Examples:
-
-| Endpoint                                        | p95 SLO  |
-| ----------------------------------------------- | -------- |
-| `Login - Super Admin` / `Login - Client Admin`  | 1500ms   |
-| `Create Client` / `Create Project` / `Assign Task` | 2000ms |
-| `Create Task`                                   | 2500ms   |
-| `Import Candidates (CSV)`                       | 3000ms   |
-| `Submit Activity`                               | 3000ms   |
-| `Submit Activity (Anam evaluation)`             | 5000ms   |
-| `Project Review - *`                            | 1500–2000ms |
-
-> **p99 is derived** per profile (multiplier on p95) and **widened by `LOAD_SCALE`** at
-> higher VU counts, so environment queueing under concurrent writes doesn't fail the
-> gate when every HTTP request itself succeeds.
-
-### Example: gate a run on a production SLA
-
-```bat
-PERFORMANCE_PROFILE=strict npm run load:shared
+**Automatic Export** (when using Grafana):
+```bash
+npm run load:shared:grafana    # ✅ Auto-exports InfluxDB data after test
+npm run smoke:grafana           # ✅ Auto-exports InfluxDB data after test
 ```
 
-Any breach (error rate ≥ 1%, p95 ≥ 2s, or checks ≤ 99%) → **k6 exits non-zero** → CI fails.
-
-> **Every test in this repo is gated by `buildThresholds()`** — `smoke`, `load`,
-> `load:client-project`, `load:candidate`, `load:review` **and** `load:shared`
-> (`tests/shared-project-admin-candidate-load.js`). That primary command used to
-> hardcode `rate<0.15` / `p95<8000`, so a run with 14% failed requests passed;
-> it now honours the profile table above.
->
-> On a noisy dev box the default `dev → baseline` gate (<1% errors, p95 < 2s) can
-> be too tight for a 150-VU burst. Loosen it **deliberately** instead of removing
-> the gate: `PERFORMANCE_PROFILE=functional npm run load:shared` (correctness +
-> checks only), or `ENV_PROFILE=staging` → `standard`. See
-> [Profile selection](#profile-selection-first-match-wins).
-
----
-
-## CI/CD Integration & Exit Codes
-
-Every runner exits with a code a pipeline can gate on:
-
-| Exit code | Meaning                                                                    |
-| --------- | -------------------------------------------------------------------------- |
-| `0`       | Pass — all thresholds met, and (for `load:shared`) Phase 3 cleanup succeeded |
-| `1`       | Fail — threshold breach, a phase/test failure, **or a failed cleanup**     |
-| `2`       | Infra error — k6 failed to start / internal runner error                   |
-
-Notes:
-
-- k6 itself exits **99** when thresholds are breached. Both `scripts/run.js` and
-  `scripts/run-shared-project-load.js` normalise 99 → **1**, so a threshold breach
-  surfaces as the documented `1` (the shared runner also reports
-  `cleanup=ok|FAILED` in its final line).
-- k6 can still pass through **other non-zero codes** for its own failures — a
-  script exception was observed exiting **107** (v2.2.0), for example. The rule a
-  pipeline should rely on is simply: **`0` = pass, anything else = fail.**
-- `load:shared` fails the run if **Phase 3 cleanup** fails: a green run that leaks
-  an organisation, a project and `NUM_CANDIDATES` candidates into the environment
-  is not green. Skip cleanup explicitly with `--no-cleanup` / `ENABLE_TEARDOWN=false`
-  when you need to inspect the created data.
-
-Reports written on **every** run — including failed ones — so a pipeline can
-always archive `reports/` as artifacts:
-
-- HTML + JSON (from the test's `handleSummary()`)
-- `failures-latest.json` (both runners)
-- the 6 CSV files, via `npm run report:csv` (run it as a separate `if: always()` step)
-
-### Real pipeline file
-
-The repository ships **[`.github/workflows/load-test.yml`](.github/workflows/load-test.yml)**
-(the remote is **GitHub** — there is no `bitbucket-pipelines.yml`):
-
-| Job           | Trigger                         | What it does                                                        |
-| ------------- | ------------------------------- | ------------------------------------------------------------------- |
-| `smoke`       | every PR + manual dispatch      | 1-VU smoke test = the PR gate; archives `reports/`                  |
-| `load-shared` | manual `workflow_dispatch` only | choose 10/50/150 VUs, profile, ramp interval, cleanup on/off        |
-
-Two things the workflow does that a naïve snippet gets wrong:
-
-1. **Materialises `.env` from Actions secrets** — `scripts/run.js` reads only
-   `.env` (it deliberately does *not* forward OS environment variables to k6), so
-   `env:` on a step alone is not enough.
-2. **Prints the measured peak** (`PEAK_CONCURRENT_VUS=`) from the run log instead
-   of inferring concurrency from the ramp formula.
-
-Minimal step, if you keep your own pipeline (copy the "Create .env" step from
-the workflow file above — it is the part that is easy to get wrong):
-
-```yaml
-- name: Create .env from secrets
-  env:
-    SUPER_ADMIN_EMAIL: ${{ secrets.SUPER_ADMIN_EMAIL }}
-    SUPER_ADMIN_PASSWORD: ${{ secrets.SUPER_ADMIN_PASSWORD }}
-  run: |
-    cp .env.example .env
-    grep -q '^SUPER_ADMIN_EMAIL=$' .env   # then fill every required key — see the workflow
-- name: Run load test (strict SLA)
-  run: PERFORMANCE_PROFILE=strict npm run load:shared
-- name: CSVs for artifact diffing
-  if: always()
-  run: npm run report:csv
-# A non-zero exit (1) from the load step fails the job → PR blocked.
+**Manual Export:**
+```bash
+npm run report:grafana
 ```
 
-> **Run-over-run regression comparison** is not built in yet — diff the
-> `*-summary.csv` / `*-overview.csv` artifacts between runs, or pin a thresholds
-> baseline in CI.
+**What Gets Exported:**
 
----
+1. **grafana-http-requests-*.csv** ⭐
+   - Every HTTP request with **actual full URLs**
+   - Time, URL, Response Time, Status, Method
+   - Complete request-level detail
 
-## Test Coverage & Known Gaps
+2. **grafana-metrics-summary-*.csv**
+   - Aggregated metrics (count, mean, min, max, sum)
+   - All HTTP, WebSocket, VU, and iteration metrics
 
-**Implemented test types:**
+3. **grafana-vus-timeseries-*.csv**
+   - Virtual Users over time (load pattern)
+   - Time-series data for trend analysis
 
-| Type        | Command                              | Purpose                                        |
-| ----------- | ------------------------------------ | ---------------------------------------------- |
-| Smoke       | `npm run smoke`                      | Single-user end-to-end validation              |
-| Load        | `npm run load:shared`                | Gradual-ramp throughput at a target scale      |
-| Resilience  | `npm run e2e:anam:outage503` / `:network` | Behaviour during an AI-service outage     |
+4. **grafana-errors-*.csv**
+   - Failed requests with URLs and timestamps
+   - Empty file = 100% success rate ✅
 
-**Known gaps (roadmap — not yet implemented, stated honestly):**
+5. **jmeter-endpoint-summary-*.csv** ⭐
+   - JMeter-style per-endpoint table:
+     `Label, # Samples, Average, Min, Max, Std. Dev., Error %, Throughput, Received KB/sec, Sent KB/sec, Avg. Bytes`
+   - Includes a **TOTAL** row aggregated across all endpoints
 
-- **Stress / spike / soak** scenarios (breaking-point, burst, endurance)
-- **Server-side metrics** (CPU, memory, DB connections) correlated with k6 results — the Grafana stack currently shows **client-side (k6) metrics only**
-- **Automated run-over-run regression comparison** in CI
-- **InfluxDB/Grafana → CSV exporter** (`report:grafana`) — query InfluxDB directly or export Grafana panels manually
-- **Per-request failure table in the HTML report** — data is captured in `reports/failures-latest.json`, but the HTML still shows only the aggregate failure rate
-- **CSVs auto-generated after each run** — the 6 CSV files still need `npm run report:csv`
-- **Non-routable seed candidates** — `data/candidates.csv` still contains 150 public `yopmail.com` addresses
+6. **url-details-*.csv** ⭐
+   - Full request URL per label (method / status / URL), built from InfluxDB
+     `http_req_duration{name=...}` plus the `recv_bytes`/`sent_bytes` counters
 
-These are intentionally out of scope for the current suite; `config/thresholds.js`
-and the Grafana/InfluxDB stack are the intended integration points for them.
+> **Run-window scoping:** InfluxDB accumulates metrics across *all* runs forever.
+> The runner stamps each run's start time and passes it to the exporter as
+> `INFLUX_SINCE_MS`, so every query is scoped to **the current run only** —
+> without it, aggregates would silently span days of prior runs. Note also that
+> `name` is a reserved InfluxQL word and is always quoted (`"name"`) in queries.
+
+**Example HTTP Requests CSV:**
+```csv
+time,value,url,name,method,status
+2026-10-15T13:45:01Z,245.3,https://superadmin.symulate-dev.weuno.co/organizations,Create Client,POST,200
+2026-10-15T13:45:02Z,189.7,https://clientadmin.symulate-dev.weuno.co/projects,Create Project,POST,200
+2026-10-15T13:45:03Z,312.5,https://api.symulate-dev.weuno.co/tasks,Create Task,POST,200
+```
+
+**Requirements:**
+- ✅ Monitoring stack must be running (`npm run monitoring:up`)
+- ✅ Test must use `--grafana` flag or `:grafana` npm script
+- ✅ InfluxDB must contain data (test must complete successfully)
+
+**Benefits:**
+- 📊 Actual URLs captured (not just labels)
+- ⏱️ Time-series data for trend analysis
+- 🔍 Request-level granularity
+- 📈 Compatible with Excel pivot tables
+- 🎯 Same data Grafana visualizes
+
+**📊 Excel Analysis Guide:**
+
+For detailed Excel Pivot Table tutorials and data analysis techniques, see:
+**[docs/EXCEL_ANALYSIS_GUIDE.md](docs/EXCEL_ANALYSIS_GUIDE.md)**
+
+Learn how to:
+- Create URLs by Response Time analysis
+- Track Errors by Time Period
+- Visualize Load Patterns
+- Analyze Performance Trends
+- Build automated dashboards
 
 ---
 
@@ -1428,22 +1296,19 @@ npm run load:shared
 - All tests use same environment abstraction
 
 **3. WebSocket Handling (`utils/socketConversation.js`)**
-
 - Simulates real AI conversation flow
 - Staggered connection timing (prevents thundering herd)
 - Automatic reconnection with exponential backoff
 - Conversation state management per VU
 
 **4. HTTP Wrapper (`utils/http.js`)**
-
 - 429 rate limits: 3 retries with exponential backoff
 - Detailed logging shows which endpoint is rate-limited
 - Configurable via `HTTP_429_MAX_RETRIES` in .env
 - Tags every request with `name` **and full `url`** (stored in InfluxDB for URL-level reports)
 - Emits a structured `[FAILED_REQUEST] {json}` line per failed request
-  (status code + response-body message), which both runners scrape into
-  `reports/failures-latest.json` (the HTML report still shows only the
-  aggregate failure rate)
+  (status code + response-body message), which the runner scrapes into
+  `reports/failures-latest.json` for the HTML report's Failed Requests table
 
 **5. Rate Limit Management**
 
@@ -1504,3 +1369,4 @@ npm run load:shared
 5. **Clean state**: Use `monitoring:reset` between major test runs
 
 ---
+

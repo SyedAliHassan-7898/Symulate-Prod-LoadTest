@@ -24,10 +24,17 @@ export function logStep(step, res) {
   }
 }
 
-// Builds a report filename tagged with scenario/mode/Anam state so runs never
-// overwrite each other and are easy to tell apart afterwards.
+// Builds a report filename tagged with scenario/mode so runs never overwrite
+// each other and are easy to tell apart afterwards.
+//
+// The Anam tag is applied ONLY to anum-outage / situation runs — not merely
+// because ANUM_API_ENABLED is false. This whole project runs with the Anum API
+// disabled, so tagging on the flag alone marked EVERY report "without-anam".
+// We now tag when the run is a situation-only scenario or one of the dedicated
+// no-anum scripts (prefix contains "anam"/"anum"); normal runs carry no tag.
 export function reportName(prefix, { SCENARIO, LOAD_MODE, ANUM_API_ENABLED }) {
-  const anamTag = ANUM_API_ENABLED ? 'with-anam' : 'without-anam';
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  return `${prefix}-${LOAD_MODE}-${SCENARIO}-${anamTag}-${ts}`;
+  const isAnamOutageRun = SCENARIO === 'situation-only' || /anam|anum/i.test(prefix);
+  const anamTag = isAnamOutageRun ? (ANUM_API_ENABLED ? '-with-anam' : '-without-anam') : '';
+  return `${prefix}-${LOAD_MODE}-${SCENARIO}${anamTag}-${ts}`;
 }

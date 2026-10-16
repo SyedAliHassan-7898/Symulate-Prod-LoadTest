@@ -15,6 +15,7 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const path = require('path');
+const { parseFailures, writeFailures } = require('./failure-utils');
 
 const { extractFailedRequest } = require('../utils/failed-request-line');
 
@@ -230,74 +231,97 @@ async function main() {
   // makes "which request failed, and why" answerable after a run.
   const child = spawn('k6', k6Args, {
     cwd: ROOT,
-    stdio: ['inherit', 'pipe', 'pipe'],
+    // Capture stderr (where k6 console.log emits [FAILED_REQUEST] lines) so we
+    // can build reports/failures-latest.json, while still streaming it live.
+    stdio: ['inherit', 'inherit', 'pipe'],
     shell: false
   });
 
-  const failures = [];
-  let pending = '';
-  const ingest = (chunk, stream) => {
-    const text = chunk.toString();
-    stream.write(text);
-    pending += text;
-    let newline = pending.indexOf('\n');
-    while (newline >= 0) {
-      const line = pending.slice(0, newline);
-      pending = pending.slice(newline + 1);
-      const record = parseFailedRequestLine(line);
-      if (record) failures.push(record);
-      newline = pending.indexOf('\n');
-    }
-  };
+  // Stamp run start so the InfluxDB exporter scopes aggregates to THIS run.
+  const RUN_START_MS = Date.now();
+
+  // Collect raw stderr to parse per-request failures after the run.
+  let stderrBuf = '';
+  child.stderr.setEncoding('utf-8');
+  child.stderr.on('data', (chunk) => {
+    process.stderr.write(chunk); // tee — keep live output
+    stderrBuf += chunk;
+  });
 
   child.on('error', (error) => {
     console.error(`[runner] Failed to start k6: ${error.message}`);
     process.exit(2);
   });
-  if (child.stdout) child.stdout.on('data', (chunk) => ingest(chunk, process.stdout));
-  if (child.stderr) child.stderr.on('data', (chunk) => ingest(chunk, process.stderr));
-
-  // 'close' (not 'exit') so the whole output has been parsed before the
-  // sidecar is written and the process exits.
-  child.on('close', (code) => {
-    const tail = parseFailedRequestLine(pending);
-    if (tail) failures.push(tail);
-    writeFailuresSidecar(failures);
-    process.exit(mapK6ExitCode(code));
-  });
-}
-
-function parseFailedRequestLine(line) {
-  // k6 v1/v2 wraps console output as `time=... level=info msg="[FAILED_REQUEST] {...}"`;
-  // the util accepts both that envelope and the bare line.
-  return extractFailedRequest(line);
-}
-
-// reports/failures-latest.json — always rewritten, so an empty array clears
-// stale failures from a previous run.
-function writeFailuresSidecar(failures) {
-  try {
-    fs.writeFileSync(
-      path.join(REPORTS_DIR, 'failures-latest.json'),
-      `${JSON.stringify(failures, null, 2)}\n`,
-      'utf8'
-    );
-    if (failures.length) {
-      console.log(`[runner] ${failures.length} failed request(s) recorded in reports/failures-latest.json`);
+  child.on('exit', (code) => {
+    // Persist per-request failures (status + message) for the HTML report.
+    try {
+      const failures = parseFailures(stderrBuf);
+      const failuresPath = writeFailures(failures);
+      console.log(`\n✓ Captured ${failures.length} failed request(s) → ${path.basename(failuresPath)}`);
+    } catch (err) {
+      console.warn(`⚠ Could not write failures file: ${err.message}`);
     }
-  } catch (error) {
-    console.error(`[runner] Could not write reports/failures-latest.json: ${error.message}`);
-  }
-}
 
-// k6 exits with 99 when thresholds are breached (and with other codes for
-// internal errors). Pipelines gate on 1 = "test failed", so 99 is normalised
-// here — otherwise a threshold breach would surface as an undocumented 99 and
-// the documented 0/1/2 table would be wrong.
-function mapK6ExitCode(code) {
-  if (code === null || code === undefined) return 1;
-  if (code === 99) return 1;
-  return code;
+    // Generate reports automatically after every test execution — including
+    // failed/threshold-breached runs (non-zero exit) so each run leaves a record.
+    console.log('\n=== Generating CSV reports ===\n');
+      try {
+        const csvReportScript = path.join(ROOT, 'scripts', 'generate-csv-report.js');
+        const csvResult = spawnSync('node', [csvReportScript], {
+          cwd: ROOT,
+          stdio: 'inherit',
+          shell: false
+        });
+        if (csvResult.status === 0) {
+          console.log('\n✓ CSV reports generated successfully');
+        } else {
+          console.warn('\n⚠ CSV report generation failed (non-fatal)');
+        }
+      } catch (err) {
+        console.warn(`⚠ Could not generate CSV reports: ${err.message}`);
+      }
+
+      console.log('\n=== Generating Professional HTML Report ===\n');
+      try {
+        const professionalReportScript = path.join(ROOT, 'scripts', 'generate-professional-report.js');
+        const htmlResult = spawnSync('node', [professionalReportScript], {
+          cwd: ROOT,
+          stdio: 'inherit',
+          shell: false
+        });
+        if (htmlResult.status === 0) {
+          console.log('\n✓ Professional HTML report generated successfully');
+        } else {
+          console.warn('\n⚠ Professional HTML report generation failed (non-fatal)');
+        }
+      } catch (err) {
+        console.warn(`⚠ Could not generate professional HTML report: ${err.message}`);
+      }
+
+      // Export Grafana/InfluxDB data if Grafana output was used
+      const influxUrl = findInfluxOutput(scriptArgs);
+      if (influxUrl) {
+        console.log('\n=== Exporting Grafana/InfluxDB Data ===\n');
+        try {
+          const influxExportScript = path.join(ROOT, 'scripts', 'export-influxdb-data.js');
+          const influxResult = spawnSync('node', [influxExportScript], {
+            cwd: ROOT,
+            stdio: 'inherit',
+            shell: false,
+            env: { ...process.env, INFLUX_SINCE_MS: String(RUN_START_MS) }
+          });
+          if (influxResult.status === 0) {
+            console.log('\n✓ Grafana data exported successfully');
+          } else {
+            console.warn('\n⚠ Grafana data export failed (non-fatal)');
+          }
+        } catch (err) {
+          console.warn(`⚠ Could not export Grafana data: ${err.message}`);
+        }
+      }
+
+    process.exit(code ?? 1);
+  });
 }
 
 main().catch((error) => {
