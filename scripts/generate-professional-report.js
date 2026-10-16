@@ -16,7 +16,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { reportsDir, loadLatestReport, metricValue, round } = require('./report-utils');
+const { reportsDir, loadLatestReport, metricValue, round, readProjectEnv, resolveConfig, requestRows } = require('./report-utils');
 
 // Severity classification based on performance thresholds
 function classifyIssue(metric, threshold) {
@@ -99,20 +99,25 @@ function analyzePerformance(data) {
 function extractTestConfig(data, sourceReport) {
   const metrics = data.metrics || {};
   const testName = sourceReport.name.replace(/^report-/, '').replace(/\.json$/i, '');
-  
-  // Try to infer test type from name
+  const fileEnv = readProjectEnv();
+
+  // Infer test type from the report name. The shared-project loader's Phase 2
+  // report is named `shared-admin-candidate-load-load-...` (contains "load"),
+  // while its Phase 1 provisioning report contains "smoke".
   let testType = 'Load Test';
-  if (testName.includes('smoke')) testType = 'Smoke Test';
-  if (testName.includes('stress')) testType = 'Stress Test';
-  if (testName.includes('soak')) testType = 'Soak Test';
-  
+  if (/\bsmoke\b/i.test(testName)) testType = 'Smoke Test';
+  if (/\bstress\b/i.test(testName)) testType = 'Stress Test';
+  if (/\bsoak\b/i.test(testName)) testType = 'Soak Test';
+  if (/\bload\b/i.test(testName)) testType = 'Load Test';
+
   return {
     testName,
     testType,
-    environment: process.env.ENV || 'Unknown',
+    environment: resolveConfig('ENV', '') || resolveConfig('ENVIRONMENT', '') || 'Unknown',
     vus: Math.round(metricValue(metrics.vus_max, 'max')),
     duration: round(metricValue(metrics.iteration_duration, 'avg') / 1000, 2),
-    iterations: Math.round(metricValue(metrics.iterations, 'count'))
+    iterations: Math.round(metricValue(metrics.iterations, 'count')),
+    fileEnv
   };
 }
 
@@ -132,6 +137,25 @@ function generateHTML(data, sourceReport) {
   const p99Response = round(metricValue(metrics.http_req_duration, 'p(99)'));
   const throughput = round(totalRequests / (config.duration || 1), 2);
   const checkRate = round(metricValue(metrics.checks, 'rate') * 100, 2);
+
+  // Per-endpoint rows (from `name:`-tagged sub-metrics). Falls back to a
+  // global TOTAL row when no per-endpoint tags exist, so this section is
+  // never empty.
+  let endpointRows = requestRows(data);
+  if (endpointRows.length === 0 && totalRequests > 0) {
+    endpointRows = [{
+      label: 'TOTAL (all requests)',
+      samples: totalRequests,
+      average: avgResponse,
+      median: round(metricValue(metrics.http_req_duration, 'med')),
+      p90: round(metricValue(metrics.http_req_duration, 'p(90)')),
+      p95: p95Response,
+      p99: p99Response,
+      min: round(metricValue(metrics.http_req_duration, 'min')),
+      max: round(metricValue(metrics.http_req_duration, 'max')),
+      errorRate: round(errorRate, 4)
+    }];
+  }
   
   // Overall status
   const overallPass = errorRate < 1 && checkRate > 99 && p95Response < 1000;
@@ -340,6 +364,14 @@ function generateHTML(data, sourceReport) {
                 <tr><td>Total Iterations</td><td>${config.iterations}</td></tr>
                 <tr><td>Total HTTP Requests</td><td>${totalRequests.toLocaleString()}</td></tr>
                 <tr><td>WebSocket Sessions</td><td>${Math.round(metricValue(metrics.ws_sessions, 'count'))}</td></tr>
+                <tr><td>Scenario</td><td>${resolveConfig('SCENARIO', 'full')}</td></tr>
+                <tr><td>Target API URL</td><td>${resolveConfig('API_URL', 'N/A')}</td></tr>
+                <tr><td>Client Admin URL</td><td>${resolveConfig('CLIENT_ADMIN_URL', 'N/A')}</td></tr>
+                <tr><td>Candidate URL</td><td>${resolveConfig('CANDIDATE_URL', 'N/A')}</td></tr>
+                <tr><td>Super Admin URL</td><td>${resolveConfig('SUPER_ADMIN_URL', 'N/A')}</td></tr>
+                <tr><td>Anam / ANUM API</td><td>${resolveConfig('ANUM_API_ENABLED', 'N/A')} (mode: ${resolveConfig('ANAM_MODE', 'N/A')})</td></tr>
+                <tr><td>Configured LOAD_VUS</td><td>${resolveConfig('LOAD_VUS', 'N/A')}</td></tr>
+                <tr><td>Configured MAX_DURATION</td><td>${resolveConfig('LOAD_MAX_DURATION', 'N/A')}</td></tr>
                 <tr><td>Test Timestamp</td><td>${generatedAt}</td></tr>
             </table>
 
@@ -429,10 +461,43 @@ function generateHTML(data, sourceReport) {
         <!-- 5. Endpoint Analysis -->
         <div class="section">
             <h2 class="section-title"><span class="section-number">5</span>Endpoint Analysis (URL Details)</h2>
+            ${endpointRows.length > 0 ? `
             <p style="color: #666; margin-bottom: 20px;">
-                Detailed per-endpoint performance breakdown available in CSV report: <code>*-url-details.csv</code>
+                Per-endpoint performance breakdown (from <code>name:</code>-tagged metrics). Full data also in <code>*-url-details.csv</code> and <code>*-aggregate.csv</code>.
             </p>
-            <p>Top endpoints by request count and response time metrics are captured in the URL Details CSV file.</p>
+            <table class="config-table">
+                <tr>
+                    <th>Endpoint / Label</th>
+                    <th>Samples</th>
+                    <th>Avg (ms)</th>
+                    <th>Median (ms)</th>
+                    <th>P90 (ms)</th>
+                    <th>P95 (ms)</th>
+                    <th>P99 (ms)</th>
+                    <th>Min (ms)</th>
+                    <th>Max (ms)</th>
+                    <th>Error %</th>
+                </tr>
+                ${endpointRows.map((row) => `
+                <tr>
+                    <td>${row.label}</td>
+                    <td>${row.samples}</td>
+                    <td>${row.average}</td>
+                    <td>${row.median}</td>
+                    <td>${row.p90}</td>
+                    <td>${row.p95}</td>
+                    <td>${row.p99}</td>
+                    <td>${row.min}</td>
+                    <td>${row.max}</td>
+                    <td>${row.errorRate}</td>
+                </tr>`).join('')}
+            </table>
+            ` : `
+            <p style="color: #666; margin-bottom: 20px;">
+                No per-endpoint (<code>name:</code>-tagged) metrics were captured for this run.
+                Detailed performance breakdown is available in the CSV reports: <code>*-url-details.csv</code> and <code>*-aggregate.csv</code>.
+            </p>
+            `}
         </div>
 
         <!-- 6. Detailed Findings -->
@@ -555,8 +620,18 @@ function generateHTML(data, sourceReport) {
 
             <h3 style="color: #495057; margin-top: 20px;">Test Scripts Info</h3>
             <ul style="margin-left: 20px; line-height: 2;">
-                <li><strong>Test Script:</strong> ${config.testName.includes('shared') ? 'tests/shared-project-admin-candidate-load.js' : 'tests/smoke.js'}</li>
-                <li><strong>Orchestrator:</strong> scripts/run-shared-project-load.js</li>
+                <li><strong>Test Script:</strong> ${(() => {
+                  const n = config.testName;
+                  if (n.includes('shared-admin-candidate')) return 'tests/shared-project-admin-candidate-load.js';
+                  if (n.includes('anam-validation-setup')) return 'tests/smoke-no-anum-setup.js';
+                  if (n.includes('candidate-assessment')) return 'tests/load-candidate-assessment.js';
+                  if (n.includes('client-project')) return 'tests/load-client-project.js';
+                  if (n.includes('project-review')) return 'tests/load-project-review.js';
+                  return 'tests/smoke.js';
+                })()}</li>
+                <li><strong>Orchestrator:</strong> ${config.testName.includes('shared') || config.testName.includes('anam-validation-setup')
+                  ? 'scripts/run-shared-project-load.js'
+                  : 'scripts/run.js'}</li>
                 <li><strong>Framework:</strong> k6 v0.45+</li>
             </ul>
         </div>

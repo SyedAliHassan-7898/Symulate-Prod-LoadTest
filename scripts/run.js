@@ -234,9 +234,9 @@ async function main() {
     process.exit(2);
   });
   child.on('exit', (code) => {
-    // Generate reports automatically after test completion
-    if (code === 0) {
-      console.log('\n=== Generating CSV reports ===\n');
+    // Generate reports automatically after every test execution — including
+    // failed/threshold-breached runs (non-zero exit) so each run leaves a record.
+    console.log('\n=== Generating CSV reports ===\n');
       try {
         const csvReportScript = path.join(ROOT, 'scripts', 'generate-csv-report.js');
         const csvResult = spawnSync('node', [csvReportScript], {
@@ -290,8 +290,7 @@ async function main() {
           console.warn(`⚠ Could not export Grafana data: ${err.message}`);
         }
       }
-    }
-    
+
     process.exit(code ?? 1);
   });
 }

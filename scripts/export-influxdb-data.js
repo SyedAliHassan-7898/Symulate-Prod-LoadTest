@@ -36,12 +36,12 @@ if (!fs.existsSync(REPORTS_DIR)) {
 function checkInfluxDB() {
   console.log('🔍 Checking InfluxDB availability...\n');
   
-  const check = spawnSync('docker', ['ps', '--filter', 'name=symulate-influxdb', '--format', '{{.Names}}'], {
+  const check = spawnSync('docker', ['ps', '--filter', 'name=k6-influxdb', '--format', '{{.Names}}'], {
     encoding: 'utf-8',
     shell: false
   });
   
-  if (check.error || !check.stdout.includes('symulate-influxdb')) {
+  if (check.error || !check.stdout.includes('k6-influxdb')) {
     console.error('❌ InfluxDB container is not running.');
     console.error('   Start monitoring stack first: npm run monitoring:up\n');
     process.exit(1);
@@ -56,7 +56,7 @@ function checkInfluxDB() {
 function executeInfluxQuery(query) {
   const result = spawnSync('docker', [
     'exec',
-    'symulate-influxdb',
+    'k6-influxdb',
     'influx',
     '-database', database,
     '-execute', query,
@@ -261,6 +261,295 @@ function exportErrorRate() {
 }
 
 /**
+ * ── InfluxDB CSV parsing helpers ─────────────────────────────────────────────
+ * The `influx -format csv` CLI returns grouped results shaped like:
+ *
+ *   name: http_req_duration
+ *   tags: name=Login - Client Admin
+ *   time,samples,avg,min,max,stddev
+ *   1970-01-01T00:00:00Z,10,123.4,50,200,10.5
+ *
+ *   name: http_req_duration
+ *   tags: name=Get Assigned Activities
+ *   ...
+ *
+ * We parse that into { tags, values } records so we can aggregate per `name`
+ * tag (and read the full `url` tag) for a JMeter-style report.
+ */
+
+// Split a CSV row, honouring double-quoted fields (URLs etc. may contain commas).
+function splitCsvRow(line) {
+  const out = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else { inQuotes = false; }
+      } else {
+        cur += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      out.push(cur); cur = '';
+    } else {
+      cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+// Parse an influx `tags: k=v,k=v` line into an object (handles \, and \\ escapes).
+function parseTagPairs(tagStr) {
+  const pairs = [];
+  let cur = '';
+  let escaped = false;
+  let inQuotes = false;
+  for (let i = 0; i < tagStr.length; i++) {
+    const c = tagStr[i];
+    if (escaped) { cur += c; escaped = false; continue; }
+    if (c === '\\') { cur += c; escaped = true; continue; }
+    if (c === '"') { inQuotes = !inQuotes; cur += c; continue; }
+    if (c === ',' && !inQuotes) { pairs.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  pairs.push(cur);
+
+  const tags = {};
+  for (const pair of pairs) {
+    const idx = pair.indexOf('=');
+    if (idx < 0) continue;
+    const key = pair.slice(0, idx).trim();
+    let val = pair.slice(idx + 1);
+    if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
+    val = val.replace(/\\(.)/g, '$1');
+    tags[key] = val;
+  }
+  return tags;
+}
+
+// Parse grouped influx CSV into [{ tags, values }] (first data row per group).
+function querySeries(query) {
+  const csv = executeInfluxQuery(query);
+  const groups = [];
+  let current = null;
+  const lines = String(csv || '').split(/\r?\n/);
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) { current = null; continue; }
+    if (line.startsWith('name:')) {
+      current = { tags: {}, columns: null, rows: [] };
+      groups.push(current);
+      continue;
+    }
+    if (!current) continue;
+    if (line.startsWith('tags:')) {
+      current.tags = parseTagPairs(line.slice(5).trim());
+      continue;
+    }
+    if (!current.columns) {
+      current.columns = splitCsvRow(line);
+    } else {
+      current.rows.push(splitCsvRow(line));
+    }
+  }
+
+  return groups
+    .filter((g) => g.columns && g.rows.length)
+    .map((g) => {
+      const row = g.rows[0];
+      const values = {};
+      g.columns.forEach((col, i) => { values[col] = row[i]; });
+      return { tags: g.tags, values };
+    });
+}
+
+function num(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function round(value, digits = 2) {
+  return num(Number(value).toFixed(digits));
+}
+
+// Derive the test window (seconds) from first/last http_reqs timestamps.
+function queryTestDurationSeconds() {
+  try {
+    const first = querySeries('SELECT first("value") FROM http_reqs');
+    const last = querySeries('SELECT last("value") FROM http_reqs');
+    const t0 = Date.parse(first[0] && first[0].values.time);
+    const t1 = Date.parse(last[0] && last[0].values.time);
+    if (Number.isFinite(t0) && Number.isFinite(t1) && t1 > t0) return (t1 - t0) / 1000;
+  } catch (err) { /* fall through */ }
+  return 0;
+}
+
+/**
+ * Build JMeter-style reports directly from InfluxDB:
+ *   1) *-jmeter-summary.csv — Label, # Samples, Average, Min, Max, Std. Dev.,
+ *      Error %, Throughput, Received KB/sec, Sent KB/sec, Avg. Bytes (+ TOTAL)
+ *   2) *-url-details.csv    — full URL breakdown per label (method/status/URL)
+ *
+ * Unlike the k6 JSON summary (which does NOT emit http_req_duration{name:...}
+ * sub-metrics unless a threshold forces them), InfluxDB stores every request
+ * tagged with both `name` and the full `url`, so we get real per-endpoint rows.
+ */
+function exportJMeterReports() {
+  console.log('📊 Building JMeter-style per-endpoint report from InfluxDB...\n');
+
+  const durationSec = queryTestDurationSeconds();
+
+  // Per-label aggregates (group by name only — matches the JMeter summary view).
+  const durations = querySeries(
+    'SELECT count("value") as "samples", mean("value") as "avg", min("value") as "min", ' +
+    'max("value") as "max", stddev("value") as "stddev", percentile("value",90) as "p90", ' +
+    'percentile("value",95) as "p95", percentile("value",99) as "p99" ' +
+    'FROM http_req_duration GROUP BY "name"'
+  );
+  if (!durations.length) {
+    console.log('⚠️  No http_req_duration data in InfluxDB — run a test with --out influxdb first.\n');
+    return [];
+  }
+
+  const fails = querySeries('SELECT sum("value") as "fails", count("value") as "total" FROM http_req_failed GROUP BY "name"');
+  const recv = querySeries('SELECT sum("value") as "bytes" FROM data_received GROUP BY "name"');
+  const sent = querySeries('SELECT sum("value") as "bytes" FROM data_sent GROUP BY "name"');
+
+  // Overall (TOTAL row) — ungrouped query over the same window.
+  const totalDur = querySeries(
+    'SELECT count("value") as "samples", mean("value") as "avg", min("value") as "min", ' +
+    'max("value") as "max", stddev("value") as "stddev" FROM http_req_duration'
+  )[0];
+  const totalFail = querySeries('SELECT sum("value") as "fails", count("value") as "total" FROM http_req_failed')[0];
+  const totalRecv = querySeries('SELECT sum("value") as "bytes" FROM data_received')[0];
+  const totalSent = querySeries('SELECT sum("value") as "bytes" FROM data_sent')[0];
+
+  const byName = (arr) => {
+    const map = {};
+    for (const item of arr) {
+      const key = item.tags.name || 'UNNAMED';
+      map[key] = item.values;
+    }
+    return map;
+  };
+  const failMap = byName(fails);
+  const recvMap = byName(recv);
+  const sentMap = byName(sent);
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const summaryFile = path.join(REPORTS_DIR, `jmeter-endpoint-summary-${ts}.csv`);
+
+  const header = ['Label', '# Samples', 'Average', 'Min', 'Max', 'Std. Dev.', 'Error %', 'Throughput', 'Received KB/sec', 'Sent KB/sec', 'Avg. Bytes'];
+  const rows = [header];
+
+  const effDur = durationSec > 0 ? durationSec : 1;
+
+  for (const item of durations) {
+    const label = item.tags.name || 'UNNAMED';
+    const v = item.values;
+    const samples = num(v.samples);
+    const failInfo = failMap[label] || {};
+    const failsN = num(failInfo.fails);
+    const totalReq = num(failInfo.total) || samples;
+    const errorPct = totalReq > 0 ? (failsN / totalReq) * 100 : 0;
+    const recvBytes = num((recvMap[label] || {}).bytes);
+    const sentBytes = num((sentMap[label] || {}).bytes);
+
+    rows.push([
+      label,
+      samples,
+      round(v.avg),
+      round(v.min),
+      round(v.max),
+      round(v.stddev),
+      round(errorPct),
+      round(samples / effDur, 5),
+      round((recvBytes / 1024) / effDur),
+      round((sentBytes / 1024) / effDur),
+      samples > 0 ? round(recvBytes / samples, 1) : 0
+    ]);
+  }
+
+  // TOTAL row (accurate, from ungrouped aggregates).
+  const tSamples = num(totalDur && totalDur.values.samples);
+  const tFailN = num(totalFail && totalFail.values.fails);
+  const tTotalReq = num(totalFail && totalFail.values.total) || tSamples;
+  const tError = tTotalReq > 0 ? (tFailN / tTotalReq) * 100 : 0;
+  const tRecv = num(totalRecv && totalRecv.values.bytes);
+  const tSent = num(totalSent && totalSent.values.bytes);
+  rows.push([
+    'TOTAL',
+    tSamples,
+    round(totalDur && totalDur.values.avg),
+    round(totalDur && totalDur.values.min),
+    round(totalDur && totalDur.values.max),
+    round(totalDur && totalDur.values.stddev),
+    round(tError),
+    round(tSamples / effDur, 5),
+    round((tRecv / 1024) / effDur),
+    round((tSent / 1024) / effDur),
+    tSamples > 0 ? round(tRecv / tSamples, 1) : 0
+  ]);
+
+  fs.writeFileSync(summaryFile, rows.map((r) => r.map(csvCell).join(',')).join('\n') + '\n', 'utf-8');
+  console.log(`✅ JMeter summary: ${path.basename(summaryFile)}  (${rows.length - 2} labels + TOTAL)`);
+  console.log(`   Test window: ${round(durationSec)}s${durationSec ? '' : ' (duration fallback = 1s)'}\n`);
+
+  // ── URL details (full URLs) ────────────────────────────────────────────────
+  const urlFile = path.join(REPORTS_DIR, `url-details-${ts}.csv`);
+  const urlDur = querySeries(
+    'SELECT count("value") as "samples", mean("value") as "avg", min("value") as "min", ' +
+    'max("value") as "max", percentile("value",90) as "p90", percentile("value",95) as "p95", ' +
+    'percentile("value",99) as "p99" FROM http_req_duration GROUP BY "name","url","method","status"'
+  );
+  const urlFail = querySeries(
+    'SELECT sum("value") as "fails", count("value") as "total" FROM http_req_failed GROUP BY "name","url","method","status"'
+  );
+  const failByKey = {};
+  for (const f of urlFail) {
+    failByKey[`${f.tags.name}|${f.tags.url}|${f.tags.method}|${f.tags.status}`] = f.values;
+  }
+
+  const urlHeader = ['Label', 'Method', 'Status', 'URL', '# Samples', 'Avg (ms)', 'Min (ms)', 'Max (ms)', 'P90 (ms)', 'P95 (ms)', 'P99 (ms)', 'Error %'];
+  const urlRows = [urlHeader];
+  for (const item of urlDur) {
+    const key = `${item.tags.name}|${item.tags.url}|${item.tags.method}|${item.tags.status}`;
+    const f = failByKey[key] || {};
+    const totalReq = num(f.total) || num(item.values.samples);
+    const errorPct = totalReq > 0 ? (num(f.fails) / totalReq) * 100 : 0;
+    urlRows.push([
+      item.tags.name || 'UNNAMED',
+      item.tags.method || '',
+      item.tags.status || '',
+      item.tags.url || '',
+      num(item.values.samples),
+      round(item.values.avg),
+      round(item.values.min),
+      round(item.values.max),
+      round(item.values.p90),
+      round(item.values.p95),
+      round(item.values.p99),
+      round(errorPct)
+    ]);
+  }
+  fs.writeFileSync(urlFile, urlRows.map((r) => r.map(csvCell).join(',')).join('\n') + '\n', 'utf-8');
+  console.log(`✅ URL details (full URLs): ${path.basename(urlFile)}  (${urlRows.length - 1} rows)\n`);
+
+  return [summaryFile, urlFile];
+}
+
+// Quote a CSV cell when needed (URLs often contain commas / quotes).
+function csvCell(value) {
+  const text = value == null ? '' : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+/**
  * Main execution
  */
 function main() {
@@ -288,6 +577,14 @@ function main() {
   
   const errorsFile = exportErrorRate();
   if (errorsFile) exportedFiles.push(errorsFile);
+  
+  // JMeter-style per-endpoint report + full URL breakdown (from name/url tags).
+  try {
+    const jmeterFiles = exportJMeterReports();
+    jmeterFiles.forEach((f) => exportedFiles.push(f));
+  } catch (err) {
+    console.warn('⚠️  JMeter report generation failed (non-fatal):', err.message, '\n');
+  }
   
   // Summary
   console.log('═══════════════════════════════════════════════════════════════\n');
@@ -318,4 +615,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { exportHttpRequestDuration, exportMetricsSummary, exportVUsTimeSeries, exportErrorRate };
+module.exports = { exportHttpRequestDuration, exportMetricsSummary, exportVUsTimeSeries, exportErrorRate, exportJMeterReports };

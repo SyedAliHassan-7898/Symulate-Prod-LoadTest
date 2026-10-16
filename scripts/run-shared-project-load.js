@@ -120,13 +120,34 @@ function redactSessionSecrets(output) {
     .replace(/(CANDIDATE_REFRESH_TOKEN=)[^\s"\\]+/g, '$1<redacted>');
 }
 
+// Detect Grafana/InfluxDB output from either the `--grafana` flag or an
+// explicit `--out influxdb=...` argument (as passed by the *:grafana npm
+// scripts). Returns the InfluxDB URL so a custom host/port is respected.
+function detectGrafanaOutput(argv) {
+  if (argv.includes('--grafana')) {
+    return { enabled: true, url: 'http://localhost:8087/k6' };
+  }
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if ((arg === '--out' || arg === '-o') && argv[i + 1] && argv[i + 1].startsWith('influxdb=')) {
+      return { enabled: true, url: argv[i + 1].slice('influxdb='.length) };
+    }
+    if (arg.startsWith('influxdb=')) {
+      return { enabled: true, url: arg.slice('influxdb='.length) };
+    }
+  }
+  return { enabled: false, url: null };
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
   const fileEnv = readEnv();
   
-  // Check for --grafana flag
-  const enableGrafana = process.argv.includes('--grafana');
+  // Detect Grafana output: either the --grafana flag or an explicit
+  // `--out influxdb=...` argument passed by the *:grafana npm scripts.
+  const grafana = detectGrafanaOutput(process.argv);
+  const enableGrafana = grafana.enabled;
 
   // Config — always read from .env file; cross-env / npm script defaults are ignored
   const NUM_CANDIDATES    = Number(fileEnv.NUM_CANDIDATES    || 10);
@@ -171,9 +192,9 @@ async function main() {
     E2E_EMIT_SESSION_SECRETS:   'false'    // links are parsed from the invitation response; don't emit raw tokens
   };
   
-  // Grafana output args for both phases
-  const grafanaArgs = enableGrafana 
-    ? ['--out', 'influxdb=http://localhost:8087/k6', '-e', 'K6_INFLUXDB_PUSH_INTERVAL=3s']
+  // Grafana output args for both phases (uses detected InfluxDB URL)
+  const grafanaArgs = enableGrafana
+    ? ['--out', `influxdb=${grafana.url}`, '-e', 'K6_INFLUXDB_PUSH_INTERVAL=3s']
     : [];
 
   const phase1 = k6('tests/smoke-no-anum-setup.js', phase1Env, grafanaArgs);
@@ -267,7 +288,7 @@ async function main() {
     ANAM_MODE:                fileEnv.ANAM_MODE || 'disabled'
   };
 
-  const phase2 = k6('tests/shared-project-admin-candidate-load.js', phase2Env);
+  const phase2 = k6('tests/shared-project-admin-candidate-load.js', phase2Env, grafanaArgs);
 
   // Cleanup temp file
   try { fs.unlinkSync(hrefsTmpPath); } catch (_) {}

@@ -113,9 +113,36 @@ function main() {
     process.exit(0);
   }
   
-  const rows = requestRows(data);
+  let rows = requestRows(data);
   const baseName = sourceReport.name.replace(/^report-/, 'symulate-report-').replace(/\.json$/i, '');
   const generatedAt = new Date().toISOString();
+
+  // Fallback: when no per-endpoint `name:` sub-metrics exist (e.g. setup runs
+  // or tests without name-tagged requests), emit a single global TOTAL row so
+  // summary/aggregate CSVs still carry real numbers instead of just headers.
+  if (rows.length === 0 && metricValue(metrics.http_reqs, 'count') > 0) {
+    const totalRequests = metricValue(metrics.http_reqs, 'count');
+    const durationSeconds = Math.max(metricValue(metrics.iteration_duration, 'avg') / 1000, 1);
+    const receivedKbSec = (metricValue(metrics.data_received, 'count') / 1024) / durationSeconds;
+    const sentKbSec = (metricValue(metrics.data_sent, 'count') / 1024) / durationSeconds;
+    rows = [{
+      label: 'TOTAL',
+      samples: Math.round(totalRequests),
+      average: round(metricValue(metrics.http_req_duration, 'avg')),
+      median: round(metricValue(metrics.http_req_duration, 'med')),
+      p90: round(metricValue(metrics.http_req_duration, 'p(90)')),
+      p95: round(metricValue(metrics.http_req_duration, 'p(95)')),
+      p99: round(metricValue(metrics.http_req_duration, 'p(99)')),
+      min: round(metricValue(metrics.http_req_duration, 'min')),
+      max: round(metricValue(metrics.http_req_duration, 'max')),
+      stddev: round(metricValue(metrics.http_req_duration, 'stddev')),
+      errorRate: round(metricValue(metrics.http_req_failed, 'rate') * 100, 4),
+      throughput: round(totalRequests / durationSeconds, 5),
+      receivedKbSec: round(receivedKbSec, 2),
+      sentKbSec: round(sentKbSec, 2),
+      avgBytes: round(metricValue(metrics.data_received, 'count') / totalRequests, 1)
+    }];
+  }
 
   const overviewPath = path.join(reportsDir, `${baseName}-overview.csv`);
   const summaryPath = path.join(reportsDir, `${baseName}-summary.csv`);
@@ -195,7 +222,21 @@ function main() {
   // URL Details CSV
   // Note: k6 captures endpoint labels (name tags) not full URLs in JSON summary
   // For full URLs, use --out csv=file.csv during test execution
-  const urlDetails = extractHttpRequests(data);
+  let urlDetails = extractHttpRequests(data);
+  // Fallback: no per-endpoint `name:` sub-metrics → emit a global TOTAL row.
+  if (urlDetails.length === 0 && metricValue(metrics.http_reqs, 'count') > 0) {
+    urlDetails = [{
+      endpoint: 'TOTAL',
+      samples: Math.round(metricValue(metrics.http_reqs, 'count')),
+      avg_ms: round(metricValue(metrics.http_req_duration, 'avg')),
+      median_ms: round(metricValue(metrics.http_req_duration, 'med')),
+      min_ms: round(metricValue(metrics.http_req_duration, 'min')),
+      max_ms: round(metricValue(metrics.http_req_duration, 'max')),
+      p90_ms: round(metricValue(metrics.http_req_duration, 'p(90)')),
+      p95_ms: round(metricValue(metrics.http_req_duration, 'p(95)')),
+      p99_ms: round(metricValue(metrics.http_req_duration, 'p(99)'))
+    }];
+  }
   writeCsv(urlDetailsPath, [
     ['API Endpoint / Operation', '# Requests', 'Avg (ms)', 'Median (ms)', 'Min (ms)', 'Max (ms)', 'P90 (ms)', 'P95 (ms)', 'P99 (ms)'],
     ...urlDetails.map((row) => [
