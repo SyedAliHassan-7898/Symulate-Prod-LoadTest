@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { reportsDir, loadLatestReport, metricValue, requestRows, checkRows, round } = require('./report-utils');
+const { reportsDir, loadLatestReport, metricValue, requestRows, checkRows, round, csvBaseNameFrom, stripReportPrefixes } = require('./report-utils');
 
 function csvEscape(value) {
   const text = value == null ? '' : String(value);
@@ -114,7 +114,9 @@ function main() {
   }
   
   let rows = requestRows(data);
-  const baseName = sourceReport.name.replace(/^report-/, 'symulate-report-').replace(/\.json$/i, '');
+  // Canonical CSV base per README: symulate-report-<base>. Strips any legacy
+  // prefix (report-/symulate-) so naming is consistent across every test.
+  const baseName = csvBaseNameFrom(sourceReport.name);
   const generatedAt = new Date().toISOString();
 
   // Fallback: when no per-endpoint `name:` sub-metrics exist (e.g. setup runs
@@ -157,7 +159,7 @@ function main() {
     ['Report Type', 'Symulate Load Test Report'],
     ['Source JSON', sourceReport.name],
     ['Generated At', generatedAt],
-    ['Test Name', baseName.replace(/^symulate-report-/, '')],
+    ['Test Name', stripReportPrefixes(sourceReport.name)],
     ['Total Requests', metricValue(metrics.http_reqs, 'count')],
     ['Failed Requests', Math.round(metricValue(metrics.http_req_failed, 'rate') * metricValue(metrics.http_reqs, 'count'))],
     ['Failed Request %', round(metricValue(metrics.http_req_failed, 'rate') * 100, 4)],

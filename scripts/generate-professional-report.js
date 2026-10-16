@@ -16,7 +16,31 @@
 
 const fs = require('fs');
 const path = require('path');
-const { reportsDir, loadLatestReport, metricValue, round, readProjectEnv, resolveConfig, requestRows } = require('./report-utils');
+const { reportsDir, loadLatestReport, metricValue, round, readProjectEnv, resolveConfig, requestRows, stripReportPrefixes } = require('./report-utils');
+const { LATEST_FAILURES } = require('./failure-utils');
+
+// Load per-request failures captured by the runner (reports/failures-latest.json).
+// k6's summary JSON only carries the aggregated http_req_failed rate, so the
+// status code + response-body message come from the runner's stderr scrape.
+function loadFailures() {
+  try {
+    if (!fs.existsSync(LATEST_FAILURES)) return [];
+    const parsed = JSON.parse(fs.readFileSync(LATEST_FAILURES, 'utf-8'));
+    return Array.isArray(parsed.failures) ? parsed.failures : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+// HTML-escape a string so failure messages (which can contain <, >, &) render
+// safely inside the report table.
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
 
 // Severity classification based on performance thresholds
 function classifyIssue(metric, threshold) {
@@ -126,6 +150,7 @@ function generateHTML(data, sourceReport) {
   const metrics = data.metrics || {};
   const config = extractTestConfig(data, sourceReport);
   const findings = analyzePerformance(data);
+  const failures = loadFailures();
   const generatedAt = new Date().toISOString();
   
   // Calculate key metrics
@@ -168,7 +193,7 @@ function generateHTML(data, sourceReport) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Load Test Report - ${config.testName}</title>
+    <title>Symulate-AI Load Test Report - ${config.testName}</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
@@ -291,7 +316,7 @@ function generateHTML(data, sourceReport) {
     <div class="container">
         <!-- Header -->
         <div class="header">
-            <h1>📊 Load Test Report</h1>
+            <h1>📊 Symulate-AI Load Test Report</h1>
             <p class="subtitle">${config.testName}</p>
             <p style="margin-top: 10px; font-size: 0.9em;">Generated: ${new Date(generatedAt).toLocaleString()}</p>
         </div>
@@ -527,6 +552,52 @@ function generateHTML(data, sourceReport) {
                     </p>
                 </div>
             `}
+
+            ${failures.length > 0 ? `
+            <h3 style="margin: 30px 0 12px; font-size: 18px; color: #333;">
+                Failed Requests (${failures.length})
+            </h3>
+            <p style="color: #666; margin-bottom: 12px; font-size: 13px;">
+                Every request that returned an error status or failed at the network layer,
+                with its response code and the server's failure message.
+            </p>
+            <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                <thead>
+                    <tr style="background: #f5f6fa; text-align: left;">
+                        <th style="padding: 10px; border-bottom: 2px solid #ddd;">#</th>
+                        <th style="padding: 10px; border-bottom: 2px solid #ddd;">Time</th>
+                        <th style="padding: 10px; border-bottom: 2px solid #ddd;">Label</th>
+                        <th style="padding: 10px; border-bottom: 2px solid #ddd;">Method</th>
+                        <th style="padding: 10px; border-bottom: 2px solid #ddd;">Status</th>
+                        <th style="padding: 10px; border-bottom: 2px solid #ddd;">Failure Message</th>
+                        <th style="padding: 10px; border-bottom: 2px solid #ddd;">URL</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${failures.map((f, i) => {
+                        const statusColor = f.status >= 500 ? '#dc3545' : (f.status >= 400 ? '#fd7e14' : '#6c757d');
+                        const time = f.at ? new Date(f.at).toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z') : '';
+                        return `
+                    <tr style="border-bottom: 1px solid #eee;">
+                        <td style="padding: 8px 10px; color: #888;">${i + 1}</td>
+                        <td style="padding: 8px 10px; white-space: nowrap; color: #666;">${escapeHtml(time)}</td>
+                        <td style="padding: 8px 10px;">${escapeHtml(f.name)}</td>
+                        <td style="padding: 8px 10px;">${escapeHtml(f.method)}</td>
+                        <td style="padding: 8px 10px;"><span style="background: ${statusColor}; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: 600;">${escapeHtml(f.status)}${f.errorCode ? ` (${f.errorCode})` : ''}</span></td>
+                        <td style="padding: 8px 10px; color: #b02a37; word-break: break-word; max-width: 380px;">${escapeHtml(f.message)}</td>
+                        <td style="padding: 8px 10px; color: #666; word-break: break-all; max-width: 300px;">${escapeHtml(f.url)}</td>
+                    </tr>`;
+                    }).join('')}
+                </tbody>
+            </table>
+            </div>
+            ` : `
+            <p style="color: #666; margin-top: 24px; font-size: 13px;">
+                No per-request failures were captured for this run (either all requests succeeded,
+                or per-request failure logging was unavailable).
+            </p>
+            `}
         </div>
 
         <!-- 7. Test Validation (Checks) -->
@@ -665,8 +736,7 @@ function main() {
     process.exit(0);
   }
   
-  const baseName = sourceReport.name.replace(/^report-/, '').replace(/\.json$/i, '');
-  const htmlPath = path.join(reportsDir, `PROFESSIONAL-${baseName}.html`);
+  const htmlPath = path.join(reportsDir, `symulate-${stripReportPrefixes(sourceReport.name)}.html`);
 
   const html = generateHTML(data, sourceReport);
   fs.writeFileSync(htmlPath, html, 'utf8');

@@ -30,6 +30,31 @@ if (!fs.existsSync(REPORTS_DIR)) {
   fs.mkdirSync(REPORTS_DIR, { recursive: true });
 }
 
+// ── Run-window scoping ──────────────────────────────────────────────────────
+// InfluxDB accumulates points from EVERY run forever, so unscoped aggregates
+// (count/mean/min/max) and the first()/last() test window would span all
+// history. The orchestrator stamps the current run's start time in
+// INFLUX_SINCE_MS; we scope every data query to that window so the JMeter
+// report reflects only the run that just executed. If the env var is absent,
+// we fall back to no scoping (standalone usage keeps old behaviour).
+const SINCE_MS = Number(process.env.INFLUX_SINCE_MS) || 0;
+const TIME_FILTER = SINCE_MS > 0 ? `time >= ${BigInt(SINCE_MS) * 1000000n}` : '';
+
+// Inject the run-window time bound into a SELECT. InfluxQL wants WHERE before
+// GROUP BY / ORDER BY / LIMIT, and existing WHERE clauses get AND-ed.
+function scoped(query) {
+  if (!TIME_FILTER) return query;
+  if (/\bWHERE\b/i.test(query)) {
+    return query.replace(/\bWHERE\b/i, `WHERE ${TIME_FILTER} AND`);
+  }
+  const m = query.match(/\b(GROUP BY|ORDER BY|LIMIT)\b/i);
+  if (m) {
+    const idx = query.indexOf(m[0]);
+    return `${query.slice(0, idx)}WHERE ${TIME_FILTER} ${query.slice(idx)}`;
+  }
+  return `${query} WHERE ${TIME_FILTER}`;
+}
+
 /**
  * Check if InfluxDB container is running
  */
@@ -54,27 +79,31 @@ function checkInfluxDB() {
  * Execute InfluxDB query and return results
  */
 function executeInfluxQuery(query) {
+  // Pipe the query via stdin instead of `-execute`. On Windows, passing a
+  // multi-line / quoted query as a CLI arg through spawnSync gets mangled
+  // (newlines truncate the arg → influx reports "empty input"). Stdin is safe.
   const result = spawnSync('docker', [
     'exec',
+    '-i',
     'k6-influxdb',
     'influx',
     '-database', database,
-    '-execute', query,
     '-format', 'csv'
   ], {
+    input: query,
     encoding: 'utf-8',
     shell: false,
     maxBuffer: 10 * 1024 * 1024 // 10MB buffer for large datasets
   });
-  
+
   if (result.error) {
     throw new Error(`Failed to execute InfluxDB query: ${result.error.message}`);
   }
-  
+
   if (result.status !== 0) {
     throw new Error(`InfluxDB query failed: ${result.stderr}`);
   }
-  
+
   return result.stdout;
 }
 
@@ -106,14 +135,10 @@ function checkDatabaseHasData() {
 function exportHttpRequestDuration() {
   console.log('📊 Exporting HTTP request durations with URLs...');
   
-  const query = `
-    SELECT time, value, url, name, method, status, expected_response
-    FROM http_req_duration
-    ORDER BY time ASC
-  `;
+  const query = 'SELECT time, "value", "url", "name", "method", "status", "expected_response" FROM http_req_duration ORDER BY time ASC';
   
   try {
-    const data = executeInfluxQuery(query);
+    const data = executeInfluxQuery(scoped(query));
     const outputFile = customOutput || path.join(REPORTS_DIR, `grafana-http-requests-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`);
     
     // Parse and clean CSV data
@@ -206,7 +231,7 @@ function exportVUsTimeSeries() {
   `;
   
   try {
-    const data = executeInfluxQuery(query);
+    const data = executeInfluxQuery(scoped(query));
     const outputFile = path.join(REPORTS_DIR, `grafana-vus-timeseries-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`);
     
     const lines = data.split('\n').filter(line => line.trim());
@@ -232,15 +257,10 @@ function exportVUsTimeSeries() {
 function exportErrorRate() {
   console.log('📊 Exporting error rate time series...');
   
-  const query = `
-    SELECT time, value, url, name, status
-    FROM http_req_failed
-    WHERE value = 1
-    ORDER BY time ASC
-  `;
+  const query = 'SELECT time, "value", "url", "name", "status" FROM http_req_failed WHERE "value" = 1 ORDER BY time ASC';
   
   try {
-    const data = executeInfluxQuery(query);
+    const data = executeInfluxQuery(scoped(query));
     const outputFile = path.join(REPORTS_DIR, `grafana-errors-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`);
     
     const lines = data.split('\n').filter(line => line.trim());
@@ -262,22 +282,25 @@ function exportErrorRate() {
 
 /**
  * ── InfluxDB CSV parsing helpers ─────────────────────────────────────────────
- * The `influx -format csv` CLI returns grouped results shaped like:
+ * `influx -format csv` returns grouped results shaped like (one header per series):
  *
- *   name: http_req_duration
- *   tags: name=Login - Client Admin
- *   time,samples,avg,min,max,stddev
- *   1970-01-01T00:00:00Z,10,123.4,50,200,10.5
+ *   name,tags,time,samples,avg
+ *   http_req_duration,name=Login - Client Admin,0,10,123.4
+ *   name,tags,time,samples,avg
+ *   http_req_duration,name=Get Assigned Activities,0,8,200.1
  *
- *   name: http_req_duration
- *   tags: name=Get Assigned Activities
- *   ...
+ * The first column `name` is the measurement name; the `tags` column holds
+ * `key=value,key=value` (comma-separated, quoted when values contain commas).
+ * For ungrouped queries (no GROUP BY) there is no `tags` column:
+ *
+ *   name,time,value
+ *   http_reqs,1791445565002253400,1
  *
  * We parse that into { tags, values } records so we can aggregate per `name`
  * tag (and read the full `url` tag) for a JMeter-style report.
  */
 
-// Split a CSV row, honouring double-quoted fields (URLs etc. may contain commas).
+// Split a CSV row, honouring double-quoted fields (tag strings / URLs may contain commas).
 function splitCsvRow(line) {
   const out = [];
   let cur = '';
@@ -302,7 +325,7 @@ function splitCsvRow(line) {
   return out;
 }
 
-// Parse an influx `tags: k=v,k=v` line into an object (handles \, and \\ escapes).
+// Parse an influx `tags` cell `k=v,k=v` into an object (handles \, and \\ escapes).
 function parseTagPairs(tagStr) {
   const pairs = [];
   let cur = '';
@@ -331,41 +354,32 @@ function parseTagPairs(tagStr) {
   return tags;
 }
 
-// Parse grouped influx CSV into [{ tags, values }] (first data row per group).
+// Parse influx CSV (grouped or ungrouped) into [{ tags, values }].
+// A header row is any row whose FIRST cell === 'name' (the measurement column).
+// Data rows follow the most recent header; `tags` column (if present) is parsed.
 function querySeries(query) {
-  const csv = executeInfluxQuery(query);
+  const csv = executeInfluxQuery(scoped(query));
+  const lines = String(csv || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const groups = [];
-  let current = null;
-  const lines = String(csv || '').split(/\r?\n/);
+  let columns = null;
 
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) { current = null; continue; }
-    if (line.startsWith('name:')) {
-      current = { tags: {}, columns: null, rows: [] };
-      groups.push(current);
+  for (const line of lines) {
+    const cells = splitCsvRow(line);
+    if (cells[0] === 'name') {
+      // Header row for the next series (repeated per series in grouped output).
+      columns = cells;
       continue;
     }
-    if (!current) continue;
-    if (line.startsWith('tags:')) {
-      current.tags = parseTagPairs(line.slice(5).trim());
-      continue;
-    }
-    if (!current.columns) {
-      current.columns = splitCsvRow(line);
-    } else {
-      current.rows.push(splitCsvRow(line));
-    }
+    if (!columns) continue;
+    const values = {};
+    columns.forEach((col, i) => {
+      if (values[col] === undefined) values[col] = cells[i]; // first wins (dup 'name' col)
+    });
+    const tags = values.tags ? parseTagPairs(values.tags) : {};
+    groups.push({ tags, values });
   }
 
-  return groups
-    .filter((g) => g.columns && g.rows.length)
-    .map((g) => {
-      const row = g.rows[0];
-      const values = {};
-      g.columns.forEach((col, i) => { values[col] = row[i]; });
-      return { tags: g.tags, values };
-    });
+  return groups;
 }
 
 function num(value) {
@@ -378,13 +392,14 @@ function round(value, digits = 2) {
 }
 
 // Derive the test window (seconds) from first/last http_reqs timestamps.
+// Influx returns `time` as a nanosecond-epoch string (e.g. 1791445565002253400).
 function queryTestDurationSeconds() {
   try {
     const first = querySeries('SELECT first("value") FROM http_reqs');
     const last = querySeries('SELECT last("value") FROM http_reqs');
-    const t0 = Date.parse(first[0] && first[0].values.time);
-    const t1 = Date.parse(last[0] && last[0].values.time);
-    if (Number.isFinite(t0) && Number.isFinite(t1) && t1 > t0) return (t1 - t0) / 1000;
+    const t0 = Number(first[0] && first[0].values.time) / 1e9;
+    const t1 = Number(last[0] && last[0].values.time) / 1e9;
+    if (Number.isFinite(t0) && Number.isFinite(t1) && t1 > t0) return t1 - t0;
   } catch (err) { /* fall through */ }
   return 0;
 }
@@ -417,8 +432,11 @@ function exportJMeterReports() {
   }
 
   const fails = querySeries('SELECT sum("value") as "fails", count("value") as "total" FROM http_req_failed GROUP BY "name"');
-  const recv = querySeries('SELECT sum("value") as "bytes" FROM data_received GROUP BY "name"');
-  const sent = querySeries('SELECT sum("value") as "bytes" FROM data_sent GROUP BY "name"');
+  // Use the suite's custom recv_bytes/sent_bytes counters (tagged with `name`);
+  // the built-in data_received/data_sent have no `name` tag, so they can't be
+  // joined per-endpoint.
+  const recv = querySeries('SELECT sum("value") as "bytes" FROM recv_bytes GROUP BY "name"');
+  const sent = querySeries('SELECT sum("value") as "bytes" FROM sent_bytes GROUP BY "name"');
 
   // Overall (TOTAL row) — ungrouped query over the same window.
   const totalDur = querySeries(
@@ -426,8 +444,8 @@ function exportJMeterReports() {
     'max("value") as "max", stddev("value") as "stddev" FROM http_req_duration'
   )[0];
   const totalFail = querySeries('SELECT sum("value") as "fails", count("value") as "total" FROM http_req_failed')[0];
-  const totalRecv = querySeries('SELECT sum("value") as "bytes" FROM data_received')[0];
-  const totalSent = querySeries('SELECT sum("value") as "bytes" FROM data_sent')[0];
+  const totalRecv = querySeries('SELECT sum("value") as "bytes" FROM recv_bytes')[0];
+  const totalSent = querySeries('SELECT sum("value") as "bytes" FROM sent_bytes')[0];
 
   const byName = (arr) => {
     const map = {};
