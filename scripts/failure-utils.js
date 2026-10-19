@@ -8,25 +8,21 @@
 
 const fs = require('fs');
 const path = require('path');
+const { parseFailedRequestLines } = require('../utils/failed-request-line');
 
 const reportsDir = path.resolve(__dirname, '..', 'reports');
 const LATEST_FAILURES = path.join(reportsDir, 'failures-latest.json');
 
 // Extract every [FAILED_REQUEST] {...} payload from a chunk of k6 output.
-// The JSON is single-line (JSON.stringify), so a non-greedy brace match is safe.
+//
+// Handled line by line through utils/failed-request-line.js: k6 v1/v2 wraps
+// console output as `time=... level=info msg="[FAILED_REQUEST] {\"...\"}"`,
+// where the payload is logfmt-escaped. A bare regex over the whole blob only
+// matches unwrapped output and would silently capture zero failures on modern
+// k6, leaving the report's failure table empty.
 function parseFailures(output) {
-  const failures = [];
-  if (!output) return failures;
-  const re = /\[FAILED_REQUEST\]\s*(\{[^\n\r]*\})/g;
-  let m;
-  while ((m = re.exec(output)) !== null) {
-    try {
-      failures.push(JSON.parse(m[1]));
-    } catch (_) {
-      // Ignore a malformed/partial line rather than aborting the whole parse.
-    }
-  }
-  return failures;
+  if (!output) return [];
+  return parseFailedRequestLines(String(output).split(/\r?\n/));
 }
 
 // Persist parsed failures for the report generator. Always writes the file

@@ -4,8 +4,9 @@
 // candidate assessment activity concurrently on the SAME shared project.
 //
 // Flow per VU:
-//   1. Client Admin login (shared credentials — 10 VUs hit same account simultaneously)
+//   1. Client Admin session (optional — see setup() below)
 //   2. GET account details, skills profile, project details  ← admin portal load
+//      (skipped when no admin session could be established)
 //   3. Candidate login via invitation href
 //   4. Accept agreement → perform all assigned activities    ← candidate load
 //
@@ -17,6 +18,14 @@
 //   SHARED_CANDIDATE_HREFS_FILE — temp file with base64 hrefs map
 //   SHARED_ORG_ID              — org id for admin portal calls
 //   LOAD_VUS                   — concurrent VUs (default 10)
+//
+// Optional admin-session env vars:
+//   SHARED_ADMIN_USER_ID       — Phase 1's NOANUMTEST_ADMIN_USER_ID; enables
+//                                Super Admin impersonation when CLIENT_ADMIN_*
+//                                credentials are absent or rejected
+//   CLIENT_ADMIN_EMAIL/PASSWORD — direct Client Admin login (optional; may be
+//                                empty — the credentials are then skipped and
+//                                impersonation is used instead)
 //
 // Load-shaping env vars:
 //   LOAD_VU_START_INTERVAL_SECONDS — seconds between VU starts (default 1.5).
@@ -38,8 +47,8 @@ import { b64decode } from 'k6/encoding';
 
 import { ANUM_API_ENABLED, SCENARIO, LOAD_MODE } from '../config/environments.js';
 import { buildThresholds } from '../config/thresholds.js';
-import { reportName, log } from '../utils/helpers.js';
-import { getJson, getJsonWithHeaders } from '../utils/http.js';
+import { reportName, log, logStep } from '../utils/helpers.js';
+import { getJson, getJsonWithHeaders, postJson, extractToken } from '../utils/http.js';
 import { routes } from '../utils/routes.js';
 import {
   candidateSessionFromInviteHref,
@@ -47,7 +56,7 @@ import {
   performAllActivities,
   ensureCandidateBooking
 } from '../scenarios/candidateassessment.js';
-import { clientAdminLogin } from '../scenarios/login.js';
+import { superAdminLogin, impersonateClientAdmin } from '../scenarios/login.js';
 
 const PROJECT_ID  = __ENV.SHARED_PROJECT_ID;
 const ORG_ID      = __ENV.SHARED_ORG_ID || '';
@@ -107,6 +116,23 @@ export const options = {
 };
 
 // ── setup() ───────────────────────────────────────────────────────────────────
+//
+// Admin session resolution — first match wins:
+//   1. Direct Client Admin login when CLIENT_ADMIN_EMAIL + CLIENT_ADMIN_PASSWORD
+//      are set in .env. Optional: when they are empty (the normal case — Phase 1
+//      mints a fresh org admin whose password only arrives by activation email)
+//      the step is skipped entirely, so it records no failed request and no
+//      failing checks.
+//   2. Super Admin impersonation of the admin Phase 1 just created
+//      (SHARED_ADMIN_USER_ID, printed by Phase 1 as NOANUMTEST_ADMIN_USER_ID).
+//      Same mechanism Phase 1 itself uses to provision the org, so it needs no
+//      password at all.
+//   3. Neither works → run WITHOUT an admin session: admin portal calls are
+//      skipped in default() and the candidate flow still runs.
+//
+// This setup used to `exec.test.abort()` whenever the direct login failed, which
+// silently killed every VU the moment the optional credentials were absent or
+// stale — Phase 2 died in setup() and no candidate ever performed.
 export function setup() {
   if (!PROJECT_ID) {
     exec.test.abort('SHARED_PROJECT_ID is not set.');
@@ -116,20 +142,66 @@ export function setup() {
   }
   log('AdminCandidateLoad', `Project=${PROJECT_ID}, candidates=${candidateEntries.length}, VUs=${LOAD_VUS}`);
 
-  // Return shared admin token so all VUs reuse the same session — this is
-  // intentional: we want to simulate N concurrent Client Admins using the
-  // SAME account (shared org dashboard), which is the realistic scenario.
-  const adminToken = clientAdminLogin(
-    __ENV.CLIENT_ADMIN_EMAIL,
-    __ENV.CLIENT_ADMIN_PASSWORD
-  );
+  // One resolved token is shared by all VUs — we want to simulate N concurrent
+  // Client Admins using the SAME account (shared org dashboard).
+  const adminToken = resolveAdminToken();
 
-  if (!adminToken) {
-    exec.test.abort('Client Admin login failed in setup(). Check CLIENT_ADMIN_EMAIL and CLIENT_ADMIN_PASSWORD in .env');
+  if (adminToken) {
+    log('AdminCandidateLoad', 'Admin session ready — token will be shared across all VUs');
+  } else {
+    log('AdminCandidateLoad', 'No admin session — admin portal calls are skipped this run; candidate flow still runs.');
+  }
+  return { adminToken: adminToken || null };
+}
+
+function resolveAdminToken() {
+  const email = String(__ENV.CLIENT_ADMIN_EMAIL || '').trim();
+  const password = String(__ENV.CLIENT_ADMIN_PASSWORD || '').trim();
+
+  // ── 1) direct login with the .env credentials (optional) ───────────────────
+  if (email && password) {
+    // Deliberately no `check()` on this attempt: a stale/rotated credential is
+    // an environment problem we recover from below, not a load-test failure.
+    // The 401/400 is still recorded in the [FAILED_REQUEST] sidecar and shown
+    // in the professional report's Failed Requests table.
+    const res = postJson(routes.login(), { email, password }, null, 'Login - Client Admin');
+    logStep('Login - Client Admin', res);
+    const token = extractToken(res);
+    if (token) {
+      check(res, {
+        'client admin login: status 2xx': (r) => r.status >= 200 && r.status < 300,
+        'client admin login: token returned': () => !!token
+      });
+      return token;
+    }
+    log(
+      'AdminCandidateLoad',
+      `[auth] CLIENT_ADMIN credentials rejected (HTTP ${res.status}) — falling back to Super Admin impersonation`
+    );
+  } else {
+    log('AdminCandidateLoad', '[auth] CLIENT_ADMIN_EMAIL/PASSWORD not set — using Super Admin impersonation for the admin session');
   }
 
-  log('AdminCandidateLoad', 'Client Admin token obtained — will be shared across all VUs');
-  return { adminToken };
+  // ── 2) impersonate the admin Phase 1 just created ──────────────────────────
+  const adminUserId = String(__ENV.SHARED_ADMIN_USER_ID || '').trim();
+  if (!adminUserId) {
+    log('AdminCandidateLoad', '[auth] SHARED_ADMIN_USER_ID not provided by the runner — cannot impersonate.');
+    return null;
+  }
+
+  const superToken = superAdminLogin();
+  if (!superToken) {
+    log('AdminCandidateLoad', '[auth] Super Admin login failed — continuing without an admin session.');
+    return null;
+  }
+
+  const token = impersonateClientAdmin(superToken, adminUserId);
+  if (!token) {
+    log('AdminCandidateLoad', `[auth] impersonation failed for adminUserId=${adminUserId} — continuing without an admin session.`);
+    return null;
+  }
+  log('AdminCandidateLoad', `[auth] impersonation token obtained for adminUserId=${adminUserId}`);
+  return token;
 }
 
 // ── default() — runs once per VU ─────────────────────────────────────────────
@@ -157,47 +229,54 @@ export default function (data) {
   // ── STEP 1: Client Admin portal load ──────────────────────────────────────
   // Simulate 10 concurrent Client Admins hitting the project dashboard.
   // These calls use the SAME admin token — all 10 VUs hit simultaneously.
+  // Skipped entirely (no failing checks, no failed requests) when setup()
+  // could not establish an admin session — the candidate flow below is
+  // independent of it.
 
-  log('AdminCandidateLoad', `VU=${__VU} → [Admin] Fetching project details`);
+  if (adminToken) {
+    log('AdminCandidateLoad', `VU=${__VU} → [Admin] Fetching project details`);
 
-  const projectRes = getJsonWithHeaders(
-    routes.projectById(PROJECT_ID),
-    adminToken,
-    'Admin - Get Project Details',
-    CLIENT_ADMIN_HEADERS
-  );
-  check(projectRes, {
-    'admin: get project details: status 2xx': (r) => r.status >= 200 && r.status < 300
-  });
-
-  // Simulate Admin fetching candidate list for the project
-  const candidatesRes = getJsonWithHeaders(
-    `${routes.projectById(PROJECT_ID)}?include=candidates`,
-    adminToken,
-    'Admin - Get Project Candidates',
-    CLIENT_ADMIN_HEADERS
-  );
-  check(candidatesRes, {
-    'admin: get project candidates: status 2xx': (r) => r.status >= 200 && r.status < 300
-  });
-
-  // Simulate Admin fetching skills profile / org account details
-  if (ORG_ID) {
-    const orgRes = getJsonWithHeaders(
-      routes.organizationById ? routes.organizationById(ORG_ID) : `${__ENV.API_URL}/organizations/${ORG_ID}`,
+    const projectRes = getJsonWithHeaders(
+      routes.projectById(PROJECT_ID),
       adminToken,
-      'Admin - Get Organization Details',
+      'Admin - Get Project Details',
       CLIENT_ADMIN_HEADERS
     );
-    check(orgRes, {
-      'admin: get org details: status 2xx': (r) => r.status >= 200 && r.status < 300
+    check(projectRes, {
+      'admin: get project details: status 2xx': (r) => r.status >= 200 && r.status < 300
     });
+
+    // Simulate Admin fetching candidate list for the project
+    const candidatesRes = getJsonWithHeaders(
+      `${routes.projectById(PROJECT_ID)}?include=candidates`,
+      adminToken,
+      'Admin - Get Project Candidates',
+      CLIENT_ADMIN_HEADERS
+    );
+    check(candidatesRes, {
+      'admin: get project candidates: status 2xx': (r) => r.status >= 200 && r.status < 300
+    });
+
+    // Simulate Admin fetching skills profile / org account details
+    if (ORG_ID) {
+      const orgRes = getJsonWithHeaders(
+        routes.organizationById ? routes.organizationById(ORG_ID) : `${__ENV.API_URL}/organizations/${ORG_ID}`,
+        adminToken,
+        'Admin - Get Organization Details',
+        CLIENT_ADMIN_HEADERS
+      );
+      check(orgRes, {
+        'admin: get org details: status 2xx': (r) => r.status >= 200 && r.status < 300
+      });
+    }
+
+    log('AdminCandidateLoad', `VU=${__VU} → [Admin] Portal calls complete`);
+
+    // Small pause — simulate admin reading the dashboard before candidate starts
+    sleep(0.5);
+  } else {
+    log('AdminCandidateLoad', `VU=${__VU} → [Admin] skipped (no admin session)`);
   }
-
-  log('AdminCandidateLoad', `VU=${__VU} → [Admin] Portal calls complete`);
-
-  // Small pause — simulate admin reading the dashboard before candidate starts
-  sleep(0.5);
 
   // ── STEP 2: Candidate assessment flow ─────────────────────────────────────
   // Each VU now switches to candidate mode using their unique invitation href

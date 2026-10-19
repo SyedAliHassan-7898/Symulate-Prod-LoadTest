@@ -10,9 +10,15 @@
 //              invitation href and performing all assigned activities against
 //              the SAME shared project.
 //
+//   Phase 3 — k6 deletes the org/project/candidates this run created
+//              (unless ENABLE_TEARDOWN=false or --no-cleanup).
+//
 // Usage:
 //   node scripts/run-shared-project-load.js
 //   npm run load:shared
+//   npm run load:shared:grafana      # InfluxDB/Grafana output for both phases
+//   npm run load:shared:keep         # skip Phase 3 cleanup
+//   npm run cleanup:shared SHARED_PROJECT_ID=<id> SHARED_ORG_ID=<id>
 
 'use strict';
 
@@ -20,8 +26,6 @@ const { spawnSync } = require('child_process');
 const fs   = require('fs');
 const path = require('path');
 const { parseFailures, writeFailures } = require('./failure-utils');
-
-const { parseFailedRequestLines } = require('../utils/failed-request-line');
 
 const ROOT    = path.resolve(__dirname, '..');
 const ENVFILE = path.join(ROOT, '.env');
@@ -74,7 +78,7 @@ function k6(script, env, extraArgs = []) {
     if (!ENV_KEY_RE.test(k)) return; // skip invalid keys silently
     args.push('-e', `${k}=${v}`);
   });
-  
+
   // Add extra args (like Grafana output)
   args.push(...extraArgs);
 
@@ -96,6 +100,11 @@ function k6(script, env, extraArgs = []) {
   // Capture per-request failures (status + message) for the HTML report.
   const failures = parseFailures(output);
   if (failures.length) ALL_FAILURES.push(...failures);
+  // Rewrite the sidecar after every phase so a crash still leaves a usable
+  // reports/failures-latest.json behind (it is always the accumulated list).
+  try { writeFailures(ALL_FAILURES); } catch (err) {
+    console.warn(`⚠ Could not write failures file: ${err.message}`);
+  }
   return { code: result.status == null ? 1 : result.status, out: output };
 }
 
@@ -130,34 +139,195 @@ function redactSessionSecrets(output) {
     .replace(/(CANDIDATE_REFRESH_TOKEN=)[^\s"\\]+/g, '$1<redacted>');
 }
 
-// Detect Grafana/InfluxDB output from either the `--grafana` flag or an
-// explicit `--out influxdb=...` argument (as passed by the *:grafana npm
-// scripts). Returns the InfluxDB URL so a custom host/port is respected.
-function detectGrafanaOutput(argv) {
-  if (argv.includes('--grafana')) {
-    return { enabled: true, url: 'http://localhost:8087/k6' };
-  }
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    if ((arg === '--out' || arg === '-o') && argv[i + 1] && argv[i + 1].startsWith('influxdb=')) {
-      return { enabled: true, url: argv[i + 1].slice('influxdb='.length) };
+// ─── CLI argument parsing ───────────────────────────────────────────────────
+//
+// The runner used to honour only `--grafana`, so the documented
+// `npm run load:shared:grafana` (which passes `--out influxdb=...` and
+// `K6_INFLUXDB_PUSH_INTERVAL=3s`) silently did nothing: neither phase ever got
+// an InfluxDB output. Now every npm-style argument is understood:
+//   --grafana                 → InfluxDB output for both phases
+//   --out <k6-output>         → forwarded verbatim to k6
+//   KEY=VALUE                 → project env override (same as scripts/run.js)
+//   --no-cleanup | --keep     → skip Phase 3 cleanup
+//   --cleanup-only            → run Phase 3 only (cleanup leftovers)
+// (ENV_KEY_RE is declared above, next to the k6() helper.)
+
+function parseRunnerArgs(argv) {
+  const parsed = {
+    k6Args: [],
+    envOverrides: {},
+    grafana: false,
+    cleanup: true,
+    cleanupOnly: false,
+    unknown: []
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+
+    if (arg === '--grafana') { parsed.grafana = true; continue; }
+    if (arg === '--no-cleanup' || arg === '--keep') { parsed.cleanup = false; continue; }
+    if (arg === '--cleanup-only') { parsed.cleanupOnly = true; continue; }
+
+    if (arg === '--out' || arg === '-o') {
+      const value = argv[index + 1];
+      if (value) {
+        parsed.k6Args.push(arg, value);
+        if (value.startsWith('influxdb=')) parsed.grafana = true;
+        index += 1;
+      }
+      continue;
     }
-    if (arg.startsWith('influxdb=')) {
-      return { enabled: true, url: arg.slice('influxdb='.length) };
+    if (arg.startsWith('--out=') || arg.startsWith('-o=')) {
+      parsed.k6Args.push(arg);
+      if (arg.includes('influxdb=')) parsed.grafana = true;
+      continue;
+    }
+
+    // KEY=VALUE — npm scripts pass these through as positional arguments.
+    const eq = arg.indexOf('=');
+    if (!arg.startsWith('-') && eq > 0 && ENV_KEY_RE.test(arg.slice(0, eq))) {
+      parsed.envOverrides[arg.slice(0, eq)] = arg.slice(eq + 1);
+      continue;
+    }
+
+    if (arg.startsWith('-')) { parsed.k6Args.push(arg); continue; }
+    parsed.unknown.push(arg);
+  }
+
+  return parsed;
+}
+
+// ─── Ramp telemetry ─────────────────────────────────────────────────────────
+//
+// tests/shared-project-admin-candidate-load.js logs WORK_START / WORK_END per
+// VU. Overlapping those windows gives the *real* number of concurrently
+// executing VUs. k6's builtin `vus` gauge counts sleeping (still-staggering)
+// VUs too, so it always reads the full VU count and cannot answer "how many
+// users were really in flight".
+function computePeakExecutingVus(output) {
+  const events = [];
+  const pattern = /\[([\d]{4}-[\d\-:.TZ]+)\][^\n]*?WORK_(START|END)\s+vu=(\d+)/g;
+  let match = pattern.exec(String(output));
+  while (match) {
+    const time = Date.parse(match[1]);
+    if (Number.isFinite(time)) {
+      events.push({ time, type: match[2], vu: Number(match[3]) });
+    }
+    match = pattern.exec(String(output));
+  }
+
+  if (!events.length) return null;
+
+  const endByVu = new Map();
+  const startByVu = new Map();
+  events.forEach((event) => {
+    if (event.type === 'START') startByVu.set(event.vu, event.time);
+    else endByVu.set(event.vu, event.time);
+  });
+
+  // Close windows whose VU never reached WORK_END (killed by maxDuration /
+  // graceful stop) at the last observed event — dropping them would undercount.
+  const lastTime = events.reduce((latest, event) => Math.max(latest, event.time), 0);
+  startByVu.forEach((start, vu) => {
+    if (!endByVu.has(vu)) endByVu.set(vu, Math.max(lastTime, start));
+  });
+
+  const sweep = [];
+  startByVu.forEach((time) => sweep.push({ time, delta: 1 }));
+  endByVu.forEach((time) => sweep.push({ time, delta: -1 }));
+  // At identical timestamps close first so ties don't inflate the peak.
+  sweep.sort((a, b) => (a.time - b.time) || (a.delta - b.delta));
+
+  let active = 0;
+  let peak = 0;
+  sweep.forEach((point) => {
+    active += point.delta;
+    if (active > peak) peak = active;
+  });
+
+  return { peak, started: startByVu.size };
+}
+
+// k6 exits 99 on threshold breach; normalise it to 1 so both runners report the
+// same documented pipeline exit codes (0 pass / 1 fail / 2 infra error).
+function mapK6ExitCode(code) {
+  if (code === null || code === undefined) return 1;
+  return code === 99 ? 1 : code;
+}
+
+// ─── Report generation ──────────────────────────────────────────────────────
+//
+// Runs after every completed run (including failed/threshold-breached ones) so
+// each run leaves CSV + professional HTML records behind. Non-fatal: a report
+// failure never changes the exit code of the load test itself.
+function generateReports({ enableGrafana, runStartMs }) {
+  console.log('\n=== Generating CSV reports ===\n');
+  try {
+    const csvResult = spawnSync('node', [path.join(ROOT, 'scripts', 'generate-csv-report.js')], {
+      cwd: ROOT,
+      stdio: 'inherit',
+      shell: false
+    });
+    if (csvResult.status === 0) {
+      console.log('\n✓ CSV reports generated successfully');
+    } else {
+      console.warn('\n⚠ CSV report generation failed (non-fatal)');
+    }
+  } catch (err) {
+    console.warn(`⚠ Could not generate CSV reports: ${err.message}`);
+  }
+
+  console.log('\n=== Generating Professional HTML Report ===\n');
+  try {
+    const htmlResult = spawnSync('node', [path.join(ROOT, 'scripts', 'generate-professional-report.js')], {
+      cwd: ROOT,
+      stdio: 'inherit',
+      shell: false
+    });
+    if (htmlResult.status === 0) {
+      console.log('\n✓ Professional HTML report generated successfully');
+    } else {
+      console.warn('\n⚠ Professional HTML report generation failed (non-fatal)');
+    }
+  } catch (err) {
+    console.warn(`⚠ Could not generate professional HTML report: ${err.message}`);
+  }
+
+  if (enableGrafana) {
+    console.log('\n=== Exporting Grafana/InfluxDB Data ===\n');
+    try {
+      const influxResult = spawnSync('node', [path.join(ROOT, 'scripts', 'export-influxdb-data.js')], {
+        cwd: ROOT,
+        stdio: 'inherit',
+        shell: false,
+        env: { ...process.env, INFLUX_SINCE_MS: String(runStartMs) }
+      });
+      if (influxResult.status === 0) {
+        console.log('\n✓ Grafana data exported successfully');
+      } else {
+        console.warn('\n⚠ Grafana data export failed (non-fatal)');
+      }
+    } catch (err) {
+      console.warn(`⚠ Could not export Grafana data: ${err.message}`);
     }
   }
-  return { enabled: false, url: null };
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
   const fileEnv = readEnv();
-  
-  // Detect Grafana output: either the --grafana flag or an explicit
-  // `--out influxdb=...` argument passed by the *:grafana npm scripts.
-  const grafana = detectGrafanaOutput(process.argv);
-  const enableGrafana = grafana.enabled;
+  const runnerArgs = parseRunnerArgs(process.argv.slice(2));
+  const enableGrafana = runnerArgs.grafana;
+
+  if (runnerArgs.unknown.length) {
+    console.warn(`[runner] Ignoring unrecognised argument(s): ${runnerArgs.unknown.join(' ')}`);
+  }
+
+  // Config — .env is the source of truth; KEY=VALUE arguments (npm script
+  // pass-throughs such as `NUM_CANDIDATES=150`) override it.
+  const env = { ...fileEnv, ...runnerArgs.envOverrides };
 
   const NUM_CANDIDATES    = Number(env.NUM_CANDIDATES    || 10);
   const LOAD_VUS          = Number(env.LOAD_VUS          || 10);
@@ -179,6 +349,63 @@ async function main() {
   // Stamp the run start so the InfluxDB exporter can scope its aggregates to
   // THIS run only (InfluxDB otherwise accumulates every run forever).
   const RUN_START_MS = Date.now();
+
+  // ── Phase 3 helpers (cleanup) ─────────────────────────────────────────────
+  //
+  // The shared runner used to force ENABLE_TEARDOWN=false in Phase 1 and never
+  // delete anything afterwards, so every run leaked one org, one project and
+  // NUM_CANDIDATES candidates into the environment.
+  function cleanupEnabled() {
+    if (!runnerArgs.cleanup) return false;
+    return String(env.ENABLE_TEARDOWN ?? 'true').trim().toLowerCase() !== 'false';
+  }
+
+  async function runCleanupPhase({ projectId, orgId, hrefsTmpPath }) {
+    if (!cleanupEnabled()) {
+      console.warn(
+        '[cleanup] SKIPPED — ENABLE_TEARDOWN=false (or --no-cleanup). ' +
+        'The organisation, project and candidates from this run remain in the environment.'
+      );
+      return true;
+    }
+    if (!projectId && !orgId) {
+      console.warn('[cleanup] SKIPPED — no org/project id available to delete.');
+      return false;
+    }
+
+    console.log('\n=== Phase 3/3 — k6: delete project, org and candidates ===\n');
+
+    const cleanupEnv = {
+      ...env,
+      SHARED_PROJECT_ID: projectId || '',
+      SHARED_ORG_ID:     orgId || ''
+    };
+    if (hrefsTmpPath && fs.existsSync(hrefsTmpPath)) {
+      cleanupEnv.SHARED_CANDIDATE_HREFS_FILE = hrefsTmpPath;
+    }
+
+    const cleanup = k6('tests/shared-project-teardown.js', cleanupEnv, []);
+    const ok = cleanup.code === 0;
+    if (ok) {
+      console.log('[cleanup] OK — this run left no data behind.');
+    } else {
+      console.error(
+        '[cleanup] FAILED — some resources may remain in the environment. ' +
+        'Re-run with: npm run cleanup:shared SHARED_PROJECT_ID=<id> SHARED_ORG_ID=<id>'
+      );
+    }
+    return ok;
+  }
+
+  // --cleanup-only: operator-driven sweep of leftovers from an earlier run.
+  if (runnerArgs.cleanupOnly) {
+    const cleanupOk = await runCleanupPhase({
+      projectId: env.SHARED_PROJECT_ID || '',
+      orgId:     env.SHARED_ORG_ID || '',
+      hrefsTmpPath: null
+    });
+    process.exit(cleanupOk ? 0 : 1);
+  }
 
   // ── PHASE 1: provision one project with all candidates ─────────────────────
   console.log('=== Phase 1/3 — k6: provision shared project + candidates ===\n');
@@ -205,11 +432,18 @@ async function main() {
     ENABLE_TEARDOWN:            'false',   // keep resources for Phase 2 (Phase 3 deletes them)
     E2E_EMIT_SESSION_SECRETS:   'false'    // links are parsed from the invitation response; don't emit raw tokens
   };
-  
-  // Grafana output args for both phases (uses detected InfluxDB URL)
-  const grafanaArgs = enableGrafana
-    ? ['--out', `influxdb=${grafana.url}`, '-e', 'K6_INFLUXDB_PUSH_INTERVAL=3s']
-    : [];
+
+  // InfluxDB output args, shared by Phase 1 and Phase 2. Previously only
+  // Phase 1 received them and only with the `--grafana` flag, so the documented
+  // `npm run load:shared:grafana` produced no live metrics at all.
+  const hasExplicitOut = runnerArgs.k6Args.includes('--out') || runnerArgs.k6Args.includes('-o');
+  const grafanaArgs = [...runnerArgs.k6Args];
+  if (enableGrafana && !hasExplicitOut) {
+    grafanaArgs.push('--out', 'influxdb=http://localhost:8087/k6');
+  }
+  if (grafanaArgs.length && !env.K6_INFLUXDB_PUSH_INTERVAL) {
+    phase1Env.K6_INFLUXDB_PUSH_INTERVAL = '3s';
+  }
 
   const phase1 = k6('tests/smoke-no-anum-setup.js', phase1Env, grafanaArgs);
 
@@ -222,6 +456,9 @@ async function main() {
   // Parse outputs
   const projectId = parseVar(phase1.out, 'NOANUMTEST_PROJECT_ID');
   const orgId     = parseVar(phase1.out, 'NOANUMTEST_ORG_ID');
+  // Phase 1's freshly created org admin — Phase 2 impersonates it for the
+  // admin session when CLIENT_ADMIN_* credentials are absent or rejected.
+  const adminUserId = parseVar(phase1.out, 'NOANUMTEST_ADMIN_USER_ID');
   const auditHrefsB64 = parseVar(phase1.out, 'NOANUMTEST_AUDIT_INVITATION_HREFS');
 
   if (phase1.code !== 0) {
@@ -265,6 +502,8 @@ async function main() {
   const candidateCount = Object.keys(candidateHrefs).length;
   console.log(`\nPhase 1 complete:`);
   console.log(`  Project ID  : ${projectId}`);
+  console.log(`  Org ID      : ${orgId || 'n/a'}`);
+  console.log(`  Admin user  : ${adminUserId || 'n/a'} (impersonation target for Phase 2)`);
   console.log(`  Candidates  : ${candidateCount} hrefs captured`);
 
   if (candidateCount === 0) {
@@ -298,6 +537,7 @@ async function main() {
     ...env,
     SHARED_PROJECT_ID:            projectId,
     SHARED_ORG_ID:                orgId || '',     // for admin portal calls
+    SHARED_ADMIN_USER_ID:         adminUserId || '', // Phase 2's impersonation fallback
     SHARED_CANDIDATE_HREFS_FILE:  hrefsTmpPath,
     LOAD_VUS:                     String(actualVUs),
     LOAD_MAX_DURATION,
@@ -337,7 +577,8 @@ async function main() {
     console.warn('[peak] WORK_START/WORK_END telemetry not found in Phase 2 output; peak concurrency unavailable.');
   }
 
-  const phase2 = k6('tests/shared-project-admin-candidate-load.js', phase2Env, grafanaArgs);
+  // ── PHASE 3: cleanup ──────────────────────────────────────────────────────
+  const cleanupOk = await runCleanupPhase({ projectId, orgId, hrefsTmpPath });
 
   // Cleanup temp file
   try { fs.unlinkSync(hrefsTmpPath); } catch (_) {}
@@ -350,65 +591,22 @@ async function main() {
     console.warn(`⚠ Could not write failures file: ${err.message}`);
   }
 
-  // Generate CSV reports automatically
-  console.log('\n=== Generating CSV reports ===\n');
-  try {
-    const reportGenScript = path.join(ROOT, 'scripts', 'generate-csv-report.js');
-    const reportResult = spawnSync('node', [reportGenScript], {
-      cwd: ROOT,
-      stdio: 'inherit',
-      shell: false
-    });
-    if (reportResult.status === 0) {
-      console.log('\n✓ CSV reports generated successfully');
-    } else {
-      console.warn('\n⚠ CSV report generation failed (non-fatal)');
-    }
-  } catch (err) {
-    console.warn(`⚠ Could not generate CSV reports: ${err.message}`);
-  }
+  // CSV + professional HTML (+ optional Grafana export) for this run.
+  generateReports({ enableGrafana, runStartMs: RUN_START_MS });
 
-  // Generate Professional HTML report automatically
-  console.log('\n=== Generating Professional HTML Report ===\n');
-  try {
-    const professionalReportScript = path.join(ROOT, 'scripts', 'generate-professional-report.js');
-    const htmlReportResult = spawnSync('node', [professionalReportScript], {
-      cwd: ROOT,
-      stdio: 'inherit',
-      shell: false
-    });
-    if (htmlReportResult.status === 0) {
-      console.log('\n✓ Professional HTML report generated successfully');
-    } else {
-      console.warn('\n⚠ Professional HTML report generation failed (non-fatal)');
-    }
-  } catch (err) {
-    console.warn(`⚠ Could not generate professional HTML report: ${err.message}`);
+  const phase2Failed = phase2.code !== 0;
+  const finalCode = phase2Failed || !cleanupOk ? 1 : 0;
+  console.log(
+    `\n=== All phases complete — Phase1=${phase1.code}, Phase2=${phase2.code}, ` +
+    `cleanup=${cleanupOk ? 'ok' : 'FAILED'}, final=${finalCode} ===`
+  );
+  if (phase2Failed && !cleanupOk) {
+    console.error('Both the load test and the cleanup failed — check the output above for leftovers.');
+  } else if (phase2Failed) {
+    console.error('Load test failed (threshold breach or runtime error); cleanup still ran.');
+  } else if (!cleanupOk) {
+    console.error('Load test passed but cleanup failed — data from this run may remain in the environment.');
   }
-
-  // Export InfluxDB/Grafana data if Grafana was enabled
-  if (enableGrafana) {
-    console.log('\n=== Exporting Grafana/InfluxDB Data ===\n');
-    try {
-      const influxExportScript = path.join(ROOT, 'scripts', 'export-influxdb-data.js');
-      const influxResult = spawnSync('node', [influxExportScript], {
-        cwd: ROOT,
-        stdio: 'inherit',
-        shell: false,
-        env: { ...process.env, INFLUX_SINCE_MS: String(RUN_START_MS) }
-      });
-      if (influxResult.status === 0) {
-        console.log('\n✓ Grafana data exported successfully');
-      } else {
-        console.warn('\n⚠ Grafana data export failed (non-fatal)');
-      }
-    } catch (err) {
-      console.warn(`⚠ Could not export Grafana data: ${err.message}`);
-    }
-  }
-
-  const finalCode = phase2.code !== 0 ? 1 : 0;
-  console.log(`\n=== All phases complete — Phase1=${phase1.code}, Phase2=${phase2.code}, final=${finalCode} ===`);
   process.exit(finalCode);
 }
 
