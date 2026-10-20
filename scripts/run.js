@@ -320,8 +320,18 @@ async function main() {
         }
       }
 
-    process.exit(code ?? 1);
+    process.exit(mapK6ExitCode(code));
   });
+}
+
+// k6 exits with 99 when thresholds are breached (and with other codes for
+// internal errors). Pipelines gate on 1 = "test failed", so 99 is normalised
+// here — otherwise a threshold breach would surface as an undocumented 99 and
+// the documented 0/1/2 table would be wrong.
+function mapK6ExitCode(code) {
+  if (code === null || code === undefined) return 1;
+  if (code === 99) return 1;
+  return code;
 }
 
 main().catch((error) => {

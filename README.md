@@ -363,9 +363,9 @@ npm run report:professional      # Generate professional HTML report
 npm run report:grafana           # Export InfluxDB/Grafana data to CSV
 ```
 
-> `report:professional` and `report:grafana` do **not** exist in `package.json` —
-> the HTML report is written by every run automatically, and there is no
-> InfluxDB→CSV exporter yet.
+> Both scripts exist: `report:professional` regenerates the HTML report from the
+> newest JSON report in `reports/`, and `report:grafana` exports InfluxDB → CSV.
+> Every run also regenerates them automatically when it finishes.
 
 ---
 
